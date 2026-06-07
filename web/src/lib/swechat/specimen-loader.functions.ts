@@ -12,14 +12,18 @@ import type {
 } from './schema'
 import type {
   LoadDiagnostic,
+  LoadedSpecimenSource,
   LoadSpecimensResult,
   PushbackKind,
   QualityTag,
   Specimen,
+  TranscriptEvent,
 } from './specimens'
 
 type ArtifactCandidate = {
   kind: ArtifactKind
+  id: string
+  label: string
   path: string
 }
 
@@ -32,10 +36,20 @@ type ParsedArtifact<TRow> = {
 
 const artifactCandidates = [
   {
+    id: 'dataset',
+    label: 'Full dataset eval cases',
+    kind: 'eval-cases',
+    path: '../artifacts/eval-cases-dataset.jsonl',
+  },
+  {
+    id: 'entireio-eval',
+    label: 'entireio/cli scored smoke',
     kind: 'eval-cases',
     path: '../artifacts/eval-cases-entireio-cli.jsonl',
   },
   {
+    id: 'candidate-pushbacks',
+    label: 'Raw pushback candidates',
     kind: 'candidate-pushbacks',
     path: '../artifacts/candidate-pushbacks-all.jsonl',
   },
@@ -44,6 +58,7 @@ const artifactCandidates = [
 export const loadSpecimens = createServerFn({ method: 'GET' }).handler(
   async (): Promise<LoadSpecimensResult> => {
     const diagnostics: LoadDiagnostic[] = []
+    const sources: LoadedSpecimenSource[] = []
     let sawArtifactFile = false
 
     for (const candidate of artifactCandidates) {
@@ -67,7 +82,8 @@ export const loadSpecimens = createServerFn({ method: 'GET' }).handler(
         const specimens = artifact.rows.map(evalCaseToSpecimen)
 
         if (specimens.length > 0) {
-          return loadedResult(candidate, specimens, artifact)
+          sources.push(loadedResult(candidate, specimens, artifact))
+          continue
         }
 
         diagnostics.push(...artifact.diagnostics)
@@ -82,15 +98,29 @@ export const loadSpecimens = createServerFn({ method: 'GET' }).handler(
       const specimens = artifact.rows.map(candidatePushbackToSpecimen)
 
       if (specimens.length > 0) {
-        return loadedResult(candidate, specimens, artifact)
+        sources.push(loadedResult(candidate, specimens, artifact))
+        continue
       }
 
       diagnostics.push(...artifact.diagnostics)
     }
 
+    if (sources.length > 0) {
+      const source = sources[0]!
+
+      return {
+        sources,
+        source,
+        specimens: source.specimens,
+      }
+    }
+
     return {
+      sources: [],
       specimens: [],
       source: {
+        id: 'none',
+        label: sawArtifactFile ? 'Invalid artifacts' : 'Missing artifacts',
         path: artifactCandidates.map((candidate) => candidate.path).join(', '),
         kind: sawArtifactFile ? 'invalid' : 'missing',
         loaded: 0,
@@ -156,17 +186,17 @@ function loadedResult<TRow>(
   candidate: ArtifactCandidate,
   specimens: Specimen[],
   artifact: ParsedArtifact<TRow>,
-): LoadSpecimensResult {
+): LoadedSpecimenSource {
   return {
+    id: candidate.id,
+    label: candidate.label,
+    path: candidate.path,
+    kind: candidate.id === 'dataset' ? 'dataset-eval-cases' : candidate.kind,
+    loaded: specimens.length,
+    parsed: artifact.parsed,
+    skipped: artifact.skipped,
+    diagnostics: artifact.diagnostics,
     specimens,
-    source: {
-      path: candidate.path,
-      kind: candidate.kind,
-      loaded: specimens.length,
-      parsed: artifact.parsed,
-      skipped: artifact.skipped,
-      diagnostics: artifact.diagnostics,
-    },
   }
 }
 
@@ -183,6 +213,13 @@ function evalCaseToSpecimen(raw: RawEvalCaseRow): Specimen {
     hasInstruction: true,
   })
   const title = titleFrom(raw.p_content, raw.i_content)
+
+  const transcript =
+    raw.chat_window && raw.chat_window.length > 0
+      ? raw.chat_window.map((turn) =>
+          chatWindowToTranscriptEvent(turn, pushback),
+        )
+      : compactTriadTranscript(raw, pushback)
 
   return {
     id: raw.case_id,
@@ -209,26 +246,7 @@ function evalCaseToSpecimen(raw: RawEvalCaseRow): Specimen {
       action: truncate(raw.a_content, 1400),
       pushback: truncate(raw.p_content, 1400),
     },
-    transcript: [
-      {
-        symbol: 'U',
-        role: 'user',
-        label: `Instruction ${raw.i_turn_id}`,
-        body: truncate(raw.i_content, 700),
-      },
-      {
-        symbol: 'A',
-        role: 'assistant',
-        label: `Action on trial ${raw.a_turn_id}`,
-        body: truncate(raw.a_content, 700),
-      },
-      {
-        symbol: pushback === 'rejection' ? 'R' : '!',
-        role: 'user',
-        label: `Held-out ${pushback} ${raw.p_turn_id}`,
-        body: truncate(raw.p_content, 700),
-      },
-    ],
+    transcript,
     trajectory: extractTrajectory(
       `${raw.i_content}\n${raw.a_content}\n${raw.p_content}`,
     ),
@@ -247,6 +265,82 @@ function evalCaseToSpecimen(raw: RawEvalCaseRow): Specimen {
       toolCalls: Math.max(0, raw.a_turn_number - raw.i_turn_number - 1),
       confidence: quality.includes('demo-worthy') ? 0.74 : 0.58,
     },
+  }
+}
+
+function compactTriadTranscript(
+  raw: RawEvalCaseRow,
+  pushback: PushbackKind,
+): TranscriptEvent[] {
+  return [
+    {
+      symbol: 'U',
+      role: 'user',
+      label: `Instruction ${raw.i_turn_id}`,
+      body: truncate(raw.i_content, 1200),
+      marker: 'I',
+      turn: raw.i_turn_number,
+    },
+    {
+      symbol: 'A',
+      role: 'assistant',
+      label: `Action on trial ${raw.a_turn_id}`,
+      body: truncate(raw.a_content, 1200),
+      marker: 'A',
+      turn: raw.a_turn_number,
+    },
+    {
+      symbol: pushback === 'rejection' ? 'R' : 'P',
+      role: 'user',
+      label: `Held-out ${pushback} ${raw.p_turn_id}`,
+      body: truncate(raw.p_content, 1200),
+      marker: 'P',
+      turn: raw.p_turn_number,
+    },
+  ]
+}
+
+function chatWindowToTranscriptEvent(
+  turn: NonNullable<RawEvalCaseRow['chat_window']>[number],
+  pushback: PushbackKind,
+): TranscriptEvent {
+  const marker = turn.marker ?? null
+  const role =
+    turn.role === 'assistant'
+      ? 'assistant'
+      : turn.role === 'user'
+        ? 'user'
+        : 'system'
+  const symbol =
+    marker === 'I'
+      ? 'U'
+      : marker === 'A'
+        ? 'A'
+        : marker === 'P'
+          ? pushback === 'rejection'
+            ? 'R'
+            : 'P'
+          : role === 'assistant'
+            ? 'A'
+            : role === 'user'
+              ? 'U'
+              : '?'
+  const label =
+    marker === 'I'
+      ? `Instruction turn ${turn.turn_number}`
+      : marker === 'A'
+        ? `Action on trial turn ${turn.turn_number}`
+        : marker === 'P'
+          ? `Held-out ${pushback} turn ${turn.turn_number}`
+          : `Turn ${turn.turn_number}`
+
+  return {
+    symbol,
+    role,
+    label,
+    body: truncate(turn.content, 1800),
+    marker,
+    turn: turn.turn_number,
   }
 }
 

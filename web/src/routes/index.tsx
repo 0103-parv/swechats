@@ -1,8 +1,15 @@
 import {
   Conversation,
   ConversationContent,
+  ConversationScrollButton,
 } from '#/components/ai-elements/conversation'
-import { Message, MessageContent } from '#/components/ai-elements/message'
+import {
+  Message,
+  MessageContent,
+  MessageResponse,
+} from '#/components/ai-elements/message'
+import { FormulaBlock } from '#/components/formula-block'
+import { episodeBindingLatex, evalFormulas } from '#/lib/eval-formulas'
 import { Terminal } from '#/components/ai-elements/terminal'
 import { Badge } from '#/components/ui/badge'
 import { Button } from '#/components/ui/button'
@@ -13,7 +20,6 @@ import {
   CardHeader,
   CardTitle,
 } from '#/components/ui/card'
-import { Checkbox } from '#/components/ui/checkbox'
 import { Input } from '#/components/ui/input'
 import { Label } from '#/components/ui/label'
 import { ScrollArea } from '#/components/ui/scroll-area'
@@ -25,7 +31,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '#/components/ui/select'
-import { Separator } from '#/components/ui/separator'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '#/components/ui/tabs'
 import { Textarea } from '#/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '#/components/ui/toggle-group'
@@ -38,42 +43,68 @@ import { cn } from '#/lib/utils'
 import { loadSpecimens } from '#/lib/swechat/specimen-loader.functions'
 import { qualityTags, units } from '#/lib/swechat/specimens'
 import type {
-  PushbackKind,
   QualityTag,
   Specimen,
+  LoadedSpecimenSource,
+  TranscriptEvent,
   Unit,
 } from '#/lib/swechat/specimens'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import {
   CheckCircle2,
+  Brain,
   Database,
   FileCode2,
   Filter,
+  FlaskConical,
   GitBranch,
+  History,
   ListChecks,
+  LockKeyhole,
+  MemoryStick,
+  Play,
+  Scale,
   Search,
+  ShieldCheck,
   Sparkles,
+  Star,
   Table2,
 } from 'lucide-react'
-
-type PushbackSearch = PushbackKind | 'all'
-type QualitySearch = QualityTag | 'all'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  filterSpecimens,
+  repoOptionsForFilters,
+} from '#/lib/swechat/workbench-filters'
+import type {
+  PushbackSearch,
+  QualitySearch,
+  RepoOption,
+  StarredSearch,
+  WorkbenchFilters,
+} from '#/lib/swechat/workbench-filters'
 
 type SearchState = {
+  source: string
   unit: Unit
   repo: string
   pushback: PushbackSearch
   quality: QualitySearch
+  starred: StarredSearch
   q: string
   selected: string | undefined
 }
 
+type UnitCounts = Record<Unit, number>
+const starredStorageKey = 'swechat-workbench-starred-cases'
+
 export const Route = createFileRoute('/')({
   validateSearch: (search): SearchState => ({
+    source: parseString(search.source, 'dataset'),
     unit: parseUnit(search.unit),
     repo: parseString(search.repo, 'all'),
     pushback: parsePushback(search.pushback),
     quality: parseQuality(search.quality),
+    starred: parseStarred(search.starred),
     q: parseString(search.q, ''),
     selected: parseOptionalString(search.selected),
   }),
@@ -82,15 +113,55 @@ export const Route = createFileRoute('/')({
 })
 
 function Home() {
-  const { specimens, source } = Route.useLoaderData()
+  const data = Route.useLoaderData()
   const search = Route.useSearch()
   const navigate = useNavigate({ from: '/' })
-  const repos = Array.from(new Set(specimens.map((item) => item.repo))).sort()
-  const filtered = filterSpecimens(specimens, search)
+  const activeLoadedSource =
+    data.sources.find((source) => source.id === search.source) ??
+    data.sources[0]
+  const activeSource = activeLoadedSource ?? data.source
+  const specimens: Specimen[] = activeLoadedSource?.specimens ?? data.specimens
+  const unitCounts = countUnits(specimens)
+  const [starredCaseKeys, setStarredCaseKeys] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const [starsLoaded, setStarsLoaded] = useState(false)
+  const starredIds = useMemo(
+    () =>
+      new Set(
+        specimens
+          .filter((specimen) =>
+            starredCaseKeys.has(starStorageKey(activeSource.id, specimen.id)),
+          )
+          .map((specimen) => specimen.id),
+      ),
+    [activeSource.id, specimens, starredCaseKeys],
+  )
+  const filters: WorkbenchFilters = {
+    unit: search.unit,
+    repo: search.repo,
+    pushback: search.pushback,
+    quality: search.quality,
+    starred: search.starred,
+    q: search.q,
+  }
+  const repos = repoOptionsForFilters(specimens, filters, starredIds)
+  const filtered = filterSpecimens(specimens, filters, starredIds)
   const selected =
-    filtered.find((item) => item.id === search.selected) ||
-    filtered[0] ||
-    specimens[0]
+    filtered.find((item) => item.id === search.selected) || filtered[0]
+
+  useEffect(() => {
+    setStarredCaseKeys(readStarredCaseKeys())
+    setStarsLoaded(true)
+  }, [])
+
+  useEffect(() => {
+    if (!starsLoaded) {
+      return
+    }
+
+    writeStarredCaseKeys(starredCaseKeys)
+  }, [starredCaseKeys, starsLoaded])
 
   const patchSearch = (patch: Partial<SearchState>) =>
     navigate({
@@ -101,6 +172,19 @@ function Home() {
       }),
     })
 
+  const toggleStar = (specimen: Specimen) => {
+    const key = starStorageKey(activeSource.id, specimen.id)
+    setStarredCaseKeys((current) => {
+      const next = new Set(current)
+      if (next.has(key)) {
+        next.delete(key)
+      } else {
+        next.add(key)
+      }
+      return next
+    })
+  }
+
   return (
     <main className="flex h-dvh min-h-[720px] flex-col bg-background text-foreground">
       <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b px-5">
@@ -110,15 +194,15 @@ function Home() {
           </div>
           <div className="min-w-0">
             <h1 className="truncate font-heading text-lg font-medium">
-              SWE-chat specimen viewer
+              SWE-chat episode eval workbench
             </h1>
             <p className="truncate text-muted-foreground text-xs">
-              {source.loaded} cases from {source.path}
+              {activeSource.loaded} cases from {activeSource.path}
             </p>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <Badge variant="secondary">{source.kind}</Badge>
+          <Badge variant="secondary">{activeSource.kind}</Badge>
           <Badge variant="outline">{filtered.length} visible</Badge>
         </div>
       </header>
@@ -130,39 +214,91 @@ function Home() {
           query={search.q}
           repo={search.repo}
           repos={repos}
+          source={activeSource.id}
+          sources={data.sources}
+          starred={search.starred}
+          starredCount={starredIds.size}
+          unitCounts={unitCounts}
           unit={search.unit}
           onChange={patchSearch}
         />
         <CandidateList
           cases={filtered}
           selectedId={selected?.id}
+          starredIds={starredIds}
           onSelect={(id) => patchSearch({ selected: id })}
+          onToggleStar={toggleStar}
         />
-        <DetailPane specimen={selected} />
+        <DetailPane
+          isStarred={selected ? starredIds.has(selected.id) : false}
+          specimen={selected}
+          onToggleStar={selected ? () => toggleStar(selected) : undefined}
+        />
       </div>
     </main>
   )
 }
 
 function FilterRail({
+  source,
+  sources,
   unit,
+  unitCounts,
   repo,
   repos,
   pushback,
   quality,
+  starred,
+  starredCount,
   query,
   onChange,
 }: {
+  source: string
+  sources: LoadedSpecimenSource[]
   unit: Unit
+  unitCounts: UnitCounts
   repo: string
-  repos: string[]
+  repos: RepoOption[]
   pushback: PushbackSearch
   quality: QualitySearch
+  starred: StarredSearch
+  starredCount: number
   query: string
   onChange: (patch: Partial<SearchState>) => void
 }) {
   return (
     <aside className="flex min-h-0 flex-col gap-5 border-r bg-muted/25 p-4">
+      <section className="flex flex-col gap-2">
+        <div className="flex items-center gap-2 text-muted-foreground text-xs font-medium">
+          <Database className="size-3.5" />
+          Source
+        </div>
+        <LabeledSelect
+          label="Artifact"
+          value={source}
+          onChange={(value) =>
+            onChange({
+              source: value,
+              repo: 'all',
+              pushback: 'all',
+              quality: 'all',
+              q: '',
+              selected: undefined,
+            })
+          }
+        >
+          {sources.length === 0 ? (
+            <SelectItem value="none">No artifacts</SelectItem>
+          ) : (
+            sources.map((item) => (
+              <SelectItem key={item.id} value={item.id}>
+                {item.label} ({item.loaded})
+              </SelectItem>
+            ))
+          )}
+        </LabeledSelect>
+      </section>
+
       <section className="flex flex-col gap-2">
         <div className="flex items-center gap-2 text-muted-foreground text-xs font-medium">
           <Table2 className="size-3.5" />
@@ -180,7 +316,11 @@ function FilterRail({
           }}
         >
           {units.slice(0, 4).map((item) => (
-            <ToggleGroupItem key={item.value} value={item.value}>
+            <ToggleGroupItem
+              disabled={unitCounts[item.value] === 0}
+              key={item.value}
+              value={item.value}
+            >
               {item.label}
             </ToggleGroupItem>
           ))}
@@ -199,8 +339,8 @@ function FilterRail({
         >
           <SelectItem value="all">All repos</SelectItem>
           {repos.map((item) => (
-            <SelectItem key={item} value={item}>
-              {item}
+            <SelectItem key={item.repo} value={item.repo}>
+              {item.repo} ({item.count})
             </SelectItem>
           ))}
         </LabeledSelect>
@@ -230,6 +370,28 @@ function FilterRail({
             </SelectItem>
           ))}
         </LabeledSelect>
+        <div className="flex flex-col gap-1.5">
+          <Label className="text-xs">Stars</Label>
+          <ToggleGroup
+            className="grid w-full grid-cols-2"
+            type="single"
+            value={starred}
+            variant="outline"
+            onValueChange={(value) => {
+              if (value) {
+                onChange({
+                  starred: value as StarredSearch,
+                  selected: undefined,
+                })
+              }
+            }}
+          >
+            <ToggleGroupItem value="all">All</ToggleGroupItem>
+            <ToggleGroupItem value="starred">
+              Starred ({starredCount})
+            </ToggleGroupItem>
+          </ToggleGroup>
+        </div>
       </section>
 
       <section className="flex flex-col gap-2">
@@ -252,12 +414,12 @@ function FilterRail({
 
       <section className="mt-auto flex flex-col gap-2 rounded-lg border bg-background p-3">
         <div className="flex items-center gap-2 text-sm font-medium">
-          <Sparkles className="size-4" />
-          Eval claim
+          <ShieldCheck className="size-4" />
+          Leakage firewall
         </div>
         <p className="text-muted-foreground text-xs leading-5">
-          The loader favors held-out I/A/P artifacts. Downstream transcript text
-          is context for judging intent, not a checklist for one generated turn.
+          Candidate agents see only x_e. Rubric generation sees o_e. Memory
+          learning sees prior same-repo sessions, never the held-out episode.
         </p>
       </section>
     </aside>
@@ -290,60 +452,66 @@ function LabeledSelect({
   )
 }
 
+function StarButton({
+  isStarred,
+  label,
+  onClick,
+}: {
+  isStarred: boolean
+  label: string
+  onClick: React.MouseEventHandler<HTMLButtonElement>
+}) {
+  return (
+    <Button
+      aria-label={label}
+      className="size-7 shrink-0"
+      size="icon"
+      type="button"
+      variant="ghost"
+      onClick={onClick}
+    >
+      <Star
+        className={cn('size-4', isStarred && 'fill-current text-amber-500')}
+      />
+    </Button>
+  )
+}
+
 function CandidateList({
   cases,
   selectedId,
+  starredIds,
   onSelect,
+  onToggleStar,
 }: {
   cases: Specimen[]
   selectedId: string | undefined
+  starredIds: ReadonlySet<string>
   onSelect: (id: string) => void
+  onToggleStar: (specimen: Specimen) => void
 }) {
   return (
     <section className="flex min-h-0 flex-col border-r">
       <div className="flex h-12 shrink-0 items-center justify-between border-b px-4">
-        <div className="font-medium text-sm">Candidates</div>
+        <div className="font-medium text-sm">Episodes</div>
         <Badge variant="outline">{cases.length}</Badge>
       </div>
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-3 p-3">
+          {cases.length === 0 && (
+            <div className="rounded-lg border border-dashed p-4 text-muted-foreground text-sm leading-6">
+              No candidates match these filters.
+            </div>
+          )}
           {cases.map((item) => (
-            <button
-              className="text-left"
+            <EpisodeListItem
+              item={item}
               key={item.id}
-              type="button"
-              onClick={() => onSelect(item.id)}
-            >
-              <Card
-                className={cn(
-                  'rounded-lg py-3 transition-colors hover:bg-muted/35',
-                  selectedId === item.id && 'bg-muted/60 ring-primary/35',
-                )}
-                size="sm"
-              >
-                <CardHeader className="px-3">
-                  <CardTitle className="line-clamp-2 text-sm">
-                    {item.title}
-                  </CardTitle>
-                  <CardDescription className="flex items-center gap-2 text-xs">
-                    <GitBranch className="size-3" />
-                    {item.repo} / turn {item.turn}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="flex flex-col gap-3 px-3">
-                  <div className="flex flex-wrap gap-1.5">
-                    <Badge variant="secondary">{item.pushback}</Badge>
-                    <Badge variant="outline">{item.intent}</Badge>
-                    {item.cleanAttribution && (
-                      <Badge variant="outline">clean attribution</Badge>
-                    )}
-                  </div>
-                  <p className="line-clamp-3 text-muted-foreground text-xs leading-5">
-                    {item.triad.pushback}
-                  </p>
-                </CardContent>
-              </Card>
-            </button>
+              selectedId={selectedId}
+              isStarred={starredIds.has(item.id)}
+              onSelect={onSelect}
+              onToggleStar={onToggleStar}
+            />
           ))}
         </div>
       </ScrollArea>
@@ -351,66 +519,172 @@ function CandidateList({
   )
 }
 
-function DetailPane({ specimen }: { specimen: Specimen | undefined }) {
+function EpisodeListItem({
+  item,
+  selectedId,
+  isStarred,
+  onSelect,
+  onToggleStar,
+}: {
+  item: Specimen
+  selectedId: string | undefined
+  isStarred: boolean
+  onSelect: (id: string) => void
+  onToggleStar: (specimen: Specimen) => void
+}) {
+  const episode = episodeModel(item)
+
+  return (
+    <article
+      className="cursor-pointer text-left"
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onSelect(item.id)
+        }
+      }}
+      onClick={() => onSelect(item.id)}
+    >
+      <Card
+        className={cn(
+          'rounded-lg py-3 transition-colors hover:bg-muted/35',
+          selectedId === item.id && 'bg-muted/60 ring-primary/35',
+        )}
+        size="sm"
+      >
+        <CardHeader className="px-3">
+          <div className="flex min-w-0 items-start gap-2">
+            <CardTitle className="line-clamp-2 flex-1 text-sm">
+              {item.title}
+            </CardTitle>
+            <StarButton
+              isStarred={isStarred}
+              label={isStarred ? 'Unstar episode' : 'Star episode'}
+              onClick={(event) => {
+                event.stopPropagation()
+                onToggleStar(item)
+              }}
+            />
+          </div>
+          <CardDescription className="flex min-w-0 items-center gap-2 text-xs">
+            <GitBranch className="size-3 shrink-0" />
+            <span className="truncate">
+              e = ({episode.repo}, {episode.session}, {episode.actionTurn})
+            </span>
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3 px-3">
+          <div className="flex flex-wrap gap-1.5">
+            {isStarred && <Badge variant="default">Starred</Badge>}
+            <Badge variant="secondary">{item.pushback}</Badge>
+            <Badge variant="outline">{item.intent}</Badge>
+            <Badge variant="outline">{item.priorSessions} prior</Badge>
+          </div>
+          <p className="line-clamp-3 text-muted-foreground text-xs leading-5">
+            {item.triad.pushback}
+          </p>
+        </CardContent>
+      </Card>
+    </article>
+  )
+}
+
+function DetailPane({
+  specimen,
+  isStarred,
+  onToggleStar,
+}: {
+  specimen: Specimen | undefined
+  isStarred: boolean
+  onToggleStar: (() => void) | undefined
+}) {
   if (!specimen) {
     return (
       <section className="grid min-h-0 place-items-center text-muted-foreground text-sm">
-        No candidate selected.
+        No episode selected.
       </section>
     )
   }
 
+  const episode = episodeModel(specimen)
+
   return (
     <section className="flex min-h-0 flex-col">
-      <div className="flex h-16 shrink-0 items-center justify-between gap-3 border-b px-5">
+      <div className="flex min-h-16 shrink-0 items-center justify-between gap-3 border-b px-5 py-2">
         <div className="min-w-0">
-          <h2 className="truncate font-heading text-base font-medium">
-            {specimen.title}
-          </h2>
-          <p className="truncate text-muted-foreground text-xs">
-            {specimen.session} / {specimen.agent} / {specimen.codingMode}
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="truncate font-heading text-base font-medium">
+              Pushback episode e
+            </h2>
+            <Badge variant="secondary">{specimen.pushback}</Badge>
+            <Badge variant="outline">{specimen.intent}</Badge>
+          </div>
+          <p className="mt-1 truncate font-mono text-muted-foreground text-xs">
+            e = ({episode.repo}, {episode.session}, {episode.actionTurn})
           </p>
         </div>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button size="sm" variant="outline">
-              <ListChecks data-icon="inline-start" />
-              Score case
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>
-            Judge cold vs warm against the held-out pushback flaw.
-          </TooltipContent>
-        </Tooltip>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button size="sm" variant="outline" onClick={onToggleStar}>
+            <Star
+              className={cn(
+                'size-4',
+                isStarred && 'fill-current text-amber-500',
+              )}
+              data-icon="inline-start"
+            />
+            {isStarred ? 'Starred' : 'Star'}
+          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button size="sm" variant="outline">
+                <ListChecks data-icon="inline-start" />
+                Score episode
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              Run A(x_e^0), A(x_e^k), then judge against R_e.
+            </TooltipContent>
+          </Tooltip>
+        </div>
       </div>
 
-      <Tabs className="flex min-h-0 flex-1 flex-col" defaultValue="triad">
+      <Tabs className="flex min-h-0 flex-1 flex-col" defaultValue="episode">
         <div className="border-b px-5 py-2">
-          <TabsList>
-            <TabsTrigger value="triad">Triad</TabsTrigger>
-            <TabsTrigger value="transcript">Transcript</TabsTrigger>
-            <TabsTrigger value="trajectory">Trajectory</TabsTrigger>
-            <TabsTrigger value="provenance">Provenance</TabsTrigger>
-            <TabsTrigger value="metrics">Metrics</TabsTrigger>
+          <TabsList className="h-auto flex-wrap justify-start">
+            <TabsTrigger value="episode">Episode</TabsTrigger>
+            <TabsTrigger value="reentry">Re-entry</TabsTrigger>
+            <TabsTrigger value="memory">Memory</TabsTrigger>
+            <TabsTrigger value="oracle">Oracle</TabsTrigger>
+            <TabsTrigger value="rubric">Rubric</TabsTrigger>
+            <TabsTrigger value="runs">Runs</TabsTrigger>
+            <TabsTrigger value="scores">Scores</TabsTrigger>
             <TabsTrigger value="raw">Raw</TabsTrigger>
           </TabsList>
         </div>
 
         <ScrollArea className="min-h-0 flex-1">
-          <TabsContent className="m-0 p-5" value="triad">
-            <Triad specimen={specimen} />
+          <TabsContent className="m-0 p-5" value="episode">
+            <EpisodeTab episode={episode} specimen={specimen} />
           </TabsContent>
-          <TabsContent className="m-0 p-5" value="transcript">
-            <Transcript specimen={specimen} />
+          <TabsContent className="m-0 p-5" value="reentry">
+            <ReentryTab episode={episode} specimen={specimen} />
           </TabsContent>
-          <TabsContent className="m-0 p-5" value="trajectory">
-            <Trajectory specimen={specimen} />
+          <TabsContent className="m-0 p-5" value="memory">
+            <MemoryTab episode={episode} specimen={specimen} />
           </TabsContent>
-          <TabsContent className="m-0 p-5" value="provenance">
-            <Provenance specimen={specimen} />
+          <TabsContent className="m-0 p-5" value="oracle">
+            <OracleTab specimen={specimen} />
           </TabsContent>
-          <TabsContent className="m-0 p-5" value="metrics">
-            <Metrics specimen={specimen} />
+          <TabsContent className="m-0 p-5" value="rubric">
+            <RubricTab specimen={specimen} />
+          </TabsContent>
+          <TabsContent className="m-0 p-5" value="runs">
+            <RunsTab specimen={specimen} />
+          </TabsContent>
+          <TabsContent className="m-0 p-5" value="scores">
+            <ScoresTab specimen={specimen} />
           </TabsContent>
           <TabsContent className="m-0 p-5" value="raw">
             <Textarea
@@ -425,184 +699,522 @@ function DetailPane({ specimen }: { specimen: Specimen | undefined }) {
   )
 }
 
-function Triad({ specimen }: { specimen: Specimen }) {
+type EpisodeModel = {
+  repo: string
+  session: string
+  instructionTurn: number
+  actionTurn: number
+  pushbackTurn: number
+  historyEvents: TranscriptEvent[]
+  tailEvents: TranscriptEvent[]
+}
+
+function EpisodeTab({
+  episode,
+  specimen,
+}: {
+  episode: EpisodeModel
+  specimen: Specimen
+}) {
   return (
-    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <div className="flex flex-col gap-4">
-        <TriadBlock label="I - instruction" text={specimen.triad.instruction} />
-        <TriadBlock label="A - action on trial" text={specimen.triad.action} />
-        <TriadBlock
-          label="P - held-out pushback"
-          text={specimen.triad.pushback}
+    <div className="flex flex-col gap-5">
+      <section className="flex flex-col gap-4 rounded-lg border p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary">e</Badge>
+          <h3 className="font-medium text-sm">
+            One held-out pushback episode
+          </h3>
+        </div>
+        <FormulaBlock
+          latex={episodeBindingLatex(
+            episode.repo,
+            episode.session,
+            episode.actionTurn,
+          )}
         />
-      </div>
+        <div className="grid gap-3 md:grid-cols-3">
+          <ObjectPanel
+            label="u_e"
+            title="Trigger instruction"
+            text={specimen.triad.instruction}
+          />
+          <ObjectPanel
+            label="a_e"
+            title="Logged action on trial"
+            text={specimen.triad.action}
+          />
+          <ObjectPanel
+            label="p_e"
+            title="Observed pushback"
+            text={specimen.triad.pushback}
+            tone="danger"
+          />
+        </div>
+      </section>
+
+      <section className="flex flex-col gap-3">
+        <div className="flex items-center gap-2 font-medium text-sm">
+          <History className="size-4" />
+          Annotated episode timeline
+        </div>
+        <ChatTranscript specimen={specimen} />
+      </section>
+    </div>
+  )
+}
+
+function ReentryTab({
+  episode,
+  specimen,
+}: {
+  episode: EpisodeModel
+  specimen: Specimen
+}) {
+  return (
+    <div className="grid gap-5 xl:grid-cols-2">
+      <PipelineCard icon={<Play className="size-4" />} title="Cold context">
+        <FormulaBlock latex={evalFormulas.coldContext} />
+        <ObjectPanel
+          label="w_e"
+          title="Workspace state"
+          text={`Checkpoint ${specimen.provenance.checkpoint}`}
+        />
+        <ObjectPanel
+          label="h_e"
+          title="Available history prefix"
+          text={historySummary(episode)}
+        />
+        <ObjectPanel
+          label="u_e"
+          title="Trigger instruction"
+          text={specimen.triad.instruction}
+        />
+      </PipelineCard>
+
+      <PipelineCard
+        icon={<MemoryStick className="size-4" />}
+        title="Warm context"
+      >
+        <FormulaBlock latex={evalFormulas.warmContext} />
+        <ObjectPanel
+          label="w_e ⊕ k_e"
+          title="Workspace with memory overlay"
+          text="Not materialized yet. This is where generated AGENTS.md / skills would be inserted before rerunning the candidate agent."
+          tone="muted"
+        />
+        <ObjectPanel
+          label="h_e"
+          title="Same history prefix"
+          text="Identical to cold. The counterfactual intervention is the memory overlay, not a different conversation."
+          tone="muted"
+        />
+        <ObjectPanel
+          label="u_e"
+          title="Same trigger instruction"
+          text={specimen.triad.instruction}
+        />
+      </PipelineCard>
+
+      <section className="xl:col-span-2">
+        <LeakageFirewall />
+      </section>
+    </div>
+  )
+}
+
+function MemoryTab({
+  episode,
+  specimen,
+}: {
+  episode: EpisodeModel
+  specimen: Specimen
+}) {
+  return (
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <PipelineCard icon={<Brain className="size-4" />} title="Memory learner">
+        <FormulaBlock latex={evalFormulas.memoryCorpus} />
+        <FormulaBlock latex={evalFormulas.memoryLearner} />
+        <div className="grid gap-3 md:grid-cols-2">
+          <ObjectPanel
+            label="d_e"
+            title="Memory corpus"
+            text={`${specimen.priorSessions} eligible earlier sessions in ${episode.repo}. The held-out session is excluded.`}
+          />
+          <ObjectPanel
+            label="k_e"
+            title="Memory artifact"
+            text="Not generated yet for this episode."
+            tone="muted"
+          />
+        </div>
+      </PipelineCard>
+
       <aside className="flex flex-col gap-4">
-        <section className="flex flex-col gap-3 rounded-lg border p-4">
-          <div className="font-medium text-sm">Candidate checklist</div>
-          {qualityTags.map((tag) => (
-            <label
-              className="grid grid-cols-[1rem_minmax(0,1fr)] items-start gap-3 text-sm leading-5"
-              key={tag}
-            >
-              <Checkbox
-                checked={specimen.quality.includes(tag)}
-                className="mt-0.5"
-                disabled
-              />
-              <span className="min-w-0 break-words">{tag}</span>
-            </label>
-          ))}
-        </section>
-        <section className="flex flex-col gap-2 rounded-lg border p-4">
-          <div className="font-medium text-sm">Why memory might help</div>
+        <PipelineCard
+          icon={<Sparkles className="size-4" />}
+          title="Memory hypothesis"
+        >
           <p className="text-muted-foreground text-sm leading-6">
             {specimen.memoryHypothesis}
           </p>
-        </section>
-        <section className="flex flex-col gap-2 rounded-lg border p-4">
-          <div className="font-medium text-sm">Judge question</div>
+        </PipelineCard>
+        <PipelineCard
+          icon={<FileCode2 className="size-4" />}
+          title="Candidate memory shape"
+        >
           <p className="text-muted-foreground text-sm leading-6">
-            {specimen.judgeQuestion}
+            {specimen.warmMemory}
           </p>
-        </section>
+        </PipelineCard>
       </aside>
     </div>
   )
 }
 
-function TriadBlock({ label, text }: { label: string; text: string }) {
-  return (
-    <section className="flex min-w-0 flex-col gap-2 rounded-lg border p-4">
-      <div className="text-muted-foreground text-xs font-medium uppercase">
-        {label}
-      </div>
-      <p className="whitespace-pre-wrap text-sm leading-6 [overflow-wrap:anywhere]">
-        {text}
-      </p>
-    </section>
-  )
-}
-
-function Transcript({ specimen }: { specimen: Specimen }) {
+function ChatTranscript({ specimen }: { specimen: Specimen }) {
   return (
     <Conversation className="h-[620px] rounded-lg border">
-      <ConversationContent className="gap-4">
+      <ConversationContent className="gap-5">
         {specimen.transcript.map((event) => (
-          <div
-            className="grid grid-cols-[2rem_minmax(0,1fr)] gap-3"
-            key={event.label}
+          <Message
+            className={cn(
+              event.marker === 'P' && 'rounded-lg ring-2 ring-destructive/25',
+              event.marker === 'A' && 'rounded-lg ring-2 ring-primary/20',
+            )}
+            from={event.role === 'assistant' ? 'assistant' : 'user'}
+            key={`${event.label}-${event.turn ?? ''}`}
           >
-            <div className="flex size-8 items-center justify-center rounded-md border bg-muted font-mono text-xs">
-              {event.symbol}
-            </div>
-            <Message from={event.role === 'assistant' ? 'assistant' : 'user'}>
-              <MessageContent>
-                <div className="text-muted-foreground text-xs font-medium">
-                  {event.label}
-                </div>
-                <p className="whitespace-pre-wrap leading-6 [overflow-wrap:anywhere]">
-                  {event.body}
-                </p>
-              </MessageContent>
-            </Message>
-          </div>
+            <MessageContent>
+              <div className="flex flex-wrap items-center gap-2 text-muted-foreground text-xs font-medium">
+                <span>{event.label}</span>
+                {event.marker && (
+                  <Badge
+                    variant={event.marker === 'P' ? 'destructive' : 'outline'}
+                  >
+                    {event.marker}
+                  </Badge>
+                )}
+                <Badge variant="secondary">{event.symbol}</Badge>
+              </div>
+              <MessageResponse className="leading-6 [overflow-wrap:anywhere]">
+                {event.body}
+              </MessageResponse>
+            </MessageContent>
+          </Message>
         ))}
       </ConversationContent>
+      <ConversationScrollButton />
     </Conversation>
   )
 }
 
-function Trajectory({ specimen }: { specimen: Specimen }) {
+function OracleTab({ specimen }: { specimen: Specimen }) {
   return (
-    <div className="flex flex-col gap-5">
-      <Terminal output={specimen.trajectory} />
-      <div className="grid gap-3 md:grid-cols-2">
-        <section className="flex flex-col gap-2 rounded-lg border p-4">
-          <div className="font-medium text-sm">Cold risk</div>
-          <p className="text-muted-foreground text-sm leading-6">
-            {specimen.coldRisk}
-          </p>
-        </section>
-        <section className="flex flex-col gap-2 rounded-lg border p-4">
-          <div className="font-medium text-sm">Warm memory candidate</div>
-          <p className="text-muted-foreground text-sm leading-6">
-            {specimen.warmMemory}
-          </p>
-        </section>
-      </div>
-    </div>
-  )
-}
-
-function Provenance({ specimen }: { specimen: Specimen }) {
-  return (
-    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <section className="flex flex-col gap-3 rounded-lg border p-4">
-        <div className="flex items-center gap-2 font-medium text-sm">
-          <FileCode2 className="size-4" />
-          Files
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <PipelineCard
+        icon={<LockKeyhole className="size-4" />}
+        title="Oracle packet"
+      >
+        <FormulaBlock latex={evalFormulas.oraclePacket} />
+        <div className="grid gap-3">
+          <ObjectPanel
+            label="u_e"
+            title="Trigger instruction"
+            text={specimen.triad.instruction}
+          />
+          <ObjectPanel
+            label="a_e"
+            title="Logged action on trial"
+            text={specimen.triad.action}
+          />
+          <ObjectPanel
+            label="p_e"
+            title="Observed pushback"
+            text={specimen.triad.pushback}
+            tone="danger"
+          />
+          <ObjectPanel
+            label="tail_e"
+            title="Logged continuation after pushback"
+            text={tailSummary(specimen)}
+            tone={
+              tailSummary(specimen) ===
+              'No downstream continuation is present in this compact artifact.'
+                ? 'muted'
+                : 'default'
+            }
+          />
+          <ObjectPanel
+            label="Δ_e"
+            title="Final accepted diff / outcome"
+            text="Not present in the current compact artifact."
+            tone="muted"
+          />
         </div>
-        {specimen.files.length === 0 ? (
-          <p className="text-muted-foreground text-sm">
-            No explicit file paths were found in the compact artifact.
+      </PipelineCard>
+
+      <aside className="flex flex-col gap-4">
+        <PipelineCard
+          icon={<ShieldCheck className="size-4" />}
+          title="Evaluator-only"
+        >
+          <p className="text-muted-foreground text-sm leading-6">
+            The oracle packet can generate the case rubric, but must never be
+            visible to the candidate agent or memory learner for this episode.
           </p>
-        ) : (
-          <div className="flex flex-col gap-2">
-            {specimen.files.map((file) => (
-              <div
-                className="grid grid-cols-[1rem_minmax(0,1fr)_auto] items-center gap-2 rounded-md bg-muted/45 px-3 py-2 text-sm"
-                key={file.path}
-              >
-                <span className="font-mono text-muted-foreground text-xs">
-                  {file.status.slice(0, 1).toUpperCase()}
-                </span>
-                <span className="truncate font-mono text-xs">{file.path}</span>
-                <Badge variant="outline">
-                  +{file.additions} / -{file.deletions}
-                </Badge>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-      <section className="flex flex-col gap-3 rounded-lg border p-4">
-        <div className="font-medium text-sm">Boundary</div>
-        <KeyValue label="Base" value={specimen.provenance.baseCommit} />
-        <KeyValue label="Checkpoint" value={specimen.provenance.checkpoint} />
-        <KeyValue label="Attribution" value={specimen.provenance.attribution} />
-        <Separator />
-        <p className="text-muted-foreground text-sm leading-6">
-          {specimen.provenance.leakageBoundary}
-        </p>
+        </PipelineCard>
+        <PipelineCard
+          icon={<FileCode2 className="size-4" />}
+          title="Workspace evidence"
+        >
+          {specimen.files.length === 0 ? (
+            <p className="text-muted-foreground text-sm leading-6">
+              No explicit file paths were found in the compact artifact.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {specimen.files.map((file) => (
+                <div
+                  className="grid grid-cols-[1rem_minmax(0,1fr)_auto] items-center gap-2 rounded-md bg-muted/45 px-3 py-2 text-sm"
+                  key={file.path}
+                >
+                  <span className="font-mono text-muted-foreground text-xs">
+                    {file.status.slice(0, 1).toUpperCase()}
+                  </span>
+                  <span className="truncate font-mono text-xs">
+                    {file.path}
+                  </span>
+                  <Badge variant="outline">
+                    +{file.additions} / -{file.deletions}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          )}
+        </PipelineCard>
+      </aside>
+    </div>
+  )
+}
+
+function RubricTab({ specimen }: { specimen: Specimen }) {
+  return (
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <PipelineCard icon={<Scale className="size-4" />} title="Case rubric">
+        <FormulaBlock latex={evalFormulas.rubric} />
+        <FormulaBlock latex={evalFormulas.criterion} />
+        <EmptyArtifact
+          title="Rubric not generated yet"
+          body="The current artifact has the oracle packet ingredients, but no persisted list of criteria. Next step is to run G(o_e) and store criteria per episode."
+        />
+      </PipelineCard>
+      <aside className="flex flex-col gap-4">
+        <PipelineCard
+          icon={<ListChecks className="size-4" />}
+          title="Seed judge question"
+        >
+          <p className="text-muted-foreground text-sm leading-6">
+            {specimen.judgeQuestion}
+          </p>
+        </PipelineCard>
+        <PipelineCard
+          icon={<CheckCircle2 className="size-4" />}
+          title="Positive convention"
+        >
+          <p className="text-muted-foreground text-sm leading-6">
+            A criterion should return 1 when the candidate action satisfies it.
+            Avoid inverted flaw-recurs scoring.
+          </p>
+        </PipelineCard>
+      </aside>
+    </div>
+  )
+}
+
+function RunsTab({ specimen }: { specimen: Specimen }) {
+  return (
+    <div className="grid gap-5 xl:grid-cols-2">
+      <PipelineCard icon={<FlaskConical className="size-4" />} title="Cold run">
+        <FormulaBlock latex={evalFormulas.coldCandidate} />
+        <EmptyArtifact
+          title="Cold candidate not run yet"
+          body={specimen.coldRisk}
+        />
+      </PipelineCard>
+      <PipelineCard icon={<MemoryStick className="size-4" />} title="Warm run">
+        <FormulaBlock latex={evalFormulas.warmCandidate} />
+        <EmptyArtifact
+          title="Warm candidate not run yet"
+          body="Generate k_e, overlay it into w_e, then rerun the same candidate agent/model/config."
+        />
+      </PipelineCard>
+      <section className="xl:col-span-2">
+        <PipelineCard
+          icon={<FileCode2 className="size-4" />}
+          title="Logged trajectory evidence"
+        >
+          <Terminal output={specimen.trajectory} />
+        </PipelineCard>
       </section>
     </div>
   )
 }
 
-function Metrics({ specimen }: { specimen: Specimen }) {
-  const metrics = [
-    ['Turns to P', specimen.metrics.turnsBeforePushback.toString()],
-    ['Files touched', specimen.metrics.filesTouched.toString()],
-    ['Tool calls', specimen.metrics.toolCalls.toString()],
-    ['Confidence', `${Math.round(specimen.metrics.confidence * 100)}%`],
-  ]
-
+function ScoresTab({ specimen }: { specimen: Specimen }) {
   return (
-    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-      {metrics.map(([label, value]) => (
-        <Card className="rounded-lg" key={label} size="sm">
-          <CardHeader>
-            <CardDescription>{label}</CardDescription>
-            <CardTitle className="text-2xl">{value}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2 text-muted-foreground text-xs">
-              <CheckCircle2 className="size-3.5" />
-              Loaded from specimen artifact
-            </div>
-          </CardContent>
-        </Card>
-      ))}
+    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <PipelineCard
+        icon={<Scale className="size-4" />}
+        title="Score definition"
+      >
+        <FormulaBlock latex={evalFormulas.score} />
+        <FormulaBlock latex={evalFormulas.lift} />
+        <EmptyArtifact
+          title="No scores yet"
+          body="Scores require generated rubric criteria plus cold and warm candidate actions."
+        />
+      </PipelineCard>
+      <aside className="flex flex-col gap-4">
+        <PipelineCard
+          icon={<Table2 className="size-4" />}
+          title="Loaded heuristics"
+        >
+          <KeyValue
+            label="Turns from u_e to p_e"
+            value={String(specimen.metrics.turnsBeforePushback)}
+          />
+          <KeyValue
+            label="Files mentioned"
+            value={String(specimen.metrics.filesTouched)}
+          />
+          <KeyValue
+            label="Trajectory commands"
+            value={String(specimen.metrics.toolCalls)}
+          />
+          <KeyValue
+            label="Artifact confidence"
+            value={`${Math.round(specimen.metrics.confidence * 100)}%`}
+          />
+        </PipelineCard>
+        <PipelineCard
+          icon={<ShieldCheck className="size-4" />}
+          title="Preemption"
+        >
+          <p className="text-muted-foreground text-sm leading-6">
+            Count preemption only when cold fails below τ and warm passes at or
+            above τ. For the first binary setup, τ = 1.
+          </p>
+        </PipelineCard>
+      </aside>
+    </div>
+  )
+}
+
+function PipelineCard({
+  icon,
+  title,
+  children,
+}: {
+  icon: React.ReactNode
+  title: string
+  children: React.ReactNode
+}) {
+  return (
+    <section className="flex min-w-0 flex-col gap-3 rounded-lg border p-4">
+      <div className="flex items-center gap-2 font-medium text-sm">
+        {icon}
+        {title}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+function ObjectPanel({
+  label,
+  title,
+  text,
+  tone = 'default',
+}: {
+  label: string
+  title: string
+  text: string
+  tone?: 'default' | 'danger' | 'muted'
+}) {
+  return (
+    <section
+      className={cn(
+        'flex min-w-0 flex-col gap-2 rounded-lg border p-3',
+        tone === 'danger' && 'border-destructive/35 bg-destructive/5',
+        tone === 'muted' && 'border-dashed bg-muted/25',
+      )}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant={tone === 'danger' ? 'destructive' : 'outline'}>
+          {label}
+        </Badge>
+        <div className="font-medium text-sm">{title}</div>
+      </div>
+      <MessageResponse className="text-muted-foreground text-sm leading-6 [overflow-wrap:anywhere]">
+        {text}
+      </MessageResponse>
+    </section>
+  )
+}
+
+function EmptyArtifact({ title, body }: { title: string; body: string }) {
+  return (
+    <section className="flex flex-col gap-2 rounded-lg border border-dashed bg-muted/20 p-4">
+      <div className="flex items-center gap-2 font-medium text-sm">
+        <LockKeyhole className="size-4" />
+        {title}
+      </div>
+      <p className="text-muted-foreground text-sm leading-6">{body}</p>
+    </section>
+  )
+}
+
+function LeakageFirewall() {
+  return (
+    <section className="grid gap-3 rounded-lg border border-primary/25 bg-primary/5 p-4 md:grid-cols-2 xl:grid-cols-4">
+      <FirewallRule
+        label="L may see"
+        value="d_e only"
+        detail="Prior same-repo sessions before s."
+      />
+      <FirewallRule
+        label="A may see"
+        value="x_e^0 or x_e^k"
+        detail="No pushback, rubric, tail, or answer key."
+      />
+      <FirewallRule
+        label="G may see"
+        value="o_e"
+        detail="Evaluator-only evidence for rubric generation."
+      />
+      <FirewallRule
+        label="J may see"
+        value="R_e and â_e^z"
+        detail="Criteria plus candidate action for one arm."
+      />
+    </section>
+  )
+}
+
+function FirewallRule({
+  label,
+  value,
+  detail,
+}: {
+  label: string
+  value: string
+  detail: string
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="text-primary text-xs font-medium">{label}</div>
+      <div className="font-mono text-xs">{value}</div>
+      <p className="text-muted-foreground text-xs leading-5">{detail}</p>
     </div>
   )
 }
@@ -616,36 +1228,65 @@ function KeyValue({ label, value }: { label: string; value: string }) {
   )
 }
 
-function filterSpecimens(specimens: Specimen[], search: SearchState) {
-  const query = search.q.trim().toLowerCase()
+function episodeModel(specimen: Specimen): EpisodeModel {
+  const instruction = specimen.transcript.find((event) => event.marker === 'I')
+  const action = specimen.transcript.find((event) => event.marker === 'A')
+  const pushback = specimen.transcript.find((event) => event.marker === 'P')
+  const instructionTurn = instruction?.turn ?? Math.max(0, specimen.turn - 2)
+  const actionTurn = action?.turn ?? Math.max(0, specimen.turn - 1)
+  const pushbackTurn = pushback?.turn ?? specimen.turn
+  const historyEvents = specimen.transcript.filter((event) =>
+    typeof event.turn === 'number' ? event.turn < instructionTurn : false,
+  )
+  const tailEvents = specimen.transcript.filter((event) =>
+    typeof event.turn === 'number' ? event.turn > pushbackTurn : false,
+  )
 
-  return specimens.filter((item) => {
-    if (search.repo !== 'all' && item.repo !== search.repo) {
-      return false
-    }
-    if (search.pushback !== 'all' && item.pushback !== search.pushback) {
-      return false
-    }
-    if (search.quality !== 'all' && !item.quality.includes(search.quality)) {
-      return false
-    }
-    if (!query) {
-      return true
-    }
+  return {
+    repo: specimen.repo,
+    session: specimen.session,
+    instructionTurn,
+    actionTurn,
+    pushbackTurn,
+    historyEvents,
+    tailEvents,
+  }
+}
 
-    return [
-      item.title,
-      item.repo,
-      item.intent,
-      item.triad.instruction,
-      item.triad.action,
-      item.triad.pushback,
-      item.files.map((file) => file.path).join(' '),
-    ]
-      .join(' ')
-      .toLowerCase()
-      .includes(query)
-  })
+function historySummary(episode: EpisodeModel): string {
+  if (episode.historyEvents.length === 0) {
+    return 'No earlier prefix turns are present in this compact artifact window. The full rerun should reconstruct h_e from the session transcript before u_e.'
+  }
+
+  return episode.historyEvents
+    .slice(0, 4)
+    .map((event) => `${event.label}: ${event.body}`)
+    .join('\n\n')
+}
+
+function tailSummary(specimen: Specimen): string {
+  const tailEvents = episodeModel(specimen).tailEvents
+
+  if (tailEvents.length === 0) {
+    return 'No downstream continuation is present in this compact artifact.'
+  }
+
+  return tailEvents
+    .slice(0, 4)
+    .map((event) => `${event.label}: ${event.body}`)
+    .join('\n\n')
+}
+
+function countUnits(specimens: Specimen[]): UnitCounts {
+  const counts = Object.fromEntries(
+    units.map((unit) => [unit.value, 0]),
+  ) as UnitCounts
+
+  for (const specimen of specimens) {
+    counts[specimen.unit] += 1
+  }
+
+  return counts
 }
 
 function parseUnit(value: unknown): Unit {
@@ -668,10 +1309,42 @@ function parseQuality(value: unknown): QualitySearch {
     : 'all'
 }
 
+function parseStarred(value: unknown): StarredSearch {
+  return value === 'starred' ? 'starred' : 'all'
+}
+
 function parseString(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback
 }
 
 function parseOptionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined
+}
+
+function starStorageKey(source: string, id: string): string {
+  return `${source}:${id}`
+}
+
+function readStarredCaseKeys(): Set<string> {
+  if (typeof window === 'undefined') {
+    return new Set()
+  }
+
+  try {
+    const raw = window.localStorage.getItem(starredStorageKey)
+    const parsed: unknown = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed)
+      ? new Set(parsed.filter((item): item is string => typeof item === 'string'))
+      : new Set()
+  } catch {
+    return new Set()
+  }
+}
+
+function writeStarredCaseKeys(keys: ReadonlySet<string>) {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  window.localStorage.setItem(starredStorageKey, JSON.stringify(Array.from(keys)))
 }

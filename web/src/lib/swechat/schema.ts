@@ -6,6 +6,19 @@ const artifactInt = z.number().int()
 
 export type ArtifactKind = 'eval-cases' | 'candidate-pushbacks'
 
+const chatWindowTurnSchema = z
+  .object({
+    turn_id: artifactString,
+    turn_number: artifactInt,
+    role: artifactString,
+    turn_type: artifactString,
+    content: artifactString,
+    prompt_intent: nullableString.optional(),
+    prompt_pushback: nullableString.optional(),
+    marker: z.enum(['I', 'A', 'P']).nullable().optional(),
+  })
+  .passthrough()
+
 export const evalCaseRowSchema = z
   .object({
     case_id: artifactString,
@@ -28,6 +41,7 @@ export const evalCaseRowSchema = z
     p_content: artifactString,
     prompt_intent: artifactString,
     prompt_pushback: artifactString,
+    chat_window: z.array(chatWindowTurnSchema).optional(),
   })
   .passthrough()
 

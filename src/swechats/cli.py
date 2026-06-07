@@ -11,6 +11,7 @@ from rich.table import Table
 
 from swechats.cases import (
     candidate_pushbacks,
+    dataset_eval_cases,
     eval_cases,
     conversation_window,
     pushback_counts,
@@ -110,6 +111,39 @@ def build_eval_cases(
     cases = eval_cases(data_dir, repo=repo, limit=limit, max_per_session=max_per_session)
     path = write_jsonl(cases, output)
     console.print(f"Wrote {len(cases)} eval cases to {path}")
+
+
+@app.command("eval-cases-dataset")
+def build_dataset_eval_cases(
+    output: Annotated[Path, typer.Argument(help="JSONL output path.")],
+    data_dir: DataDir = Path("data/swe-chat"),
+    repo: Annotated[
+        str | None,
+        typer.Option("--repo", help="Optional repository id, e.g. entireio/cli."),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 1_500,
+    max_per_repo: Annotated[int, typer.Option("--max-per-repo")] = 120,
+    max_per_session: Annotated[int, typer.Option("--max-per-session")] = 4,
+    min_prior_sessions: Annotated[int, typer.Option("--min-prior-sessions")] = 5,
+    candidate_multiplier: Annotated[int, typer.Option("--candidate-multiplier")] = 5,
+    window_before: Annotated[int, typer.Option("--window-before")] = 2,
+    window_after: Annotated[int, typer.Option("--window-after")] = 2,
+) -> None:
+    """Export joined I/A/P eval cases with compact real chat windows."""
+
+    cases = dataset_eval_cases(
+        data_dir,
+        repo=repo,
+        limit=limit,
+        max_per_repo=max_per_repo,
+        max_per_session=max_per_session,
+        min_prior_sessions=min_prior_sessions,
+        candidate_multiplier=candidate_multiplier,
+        window_before=window_before,
+        window_after=window_after,
+    )
+    path = write_jsonl(cases, output)
+    console.print(f"Wrote {len(cases)} dataset eval cases to {path}")
 
 
 @app.command("window")

@@ -13,10 +13,12 @@ export type QualityTag =
   | 'demo-worthy'
 
 export type TranscriptEvent = {
-  symbol: 'U' | 'A' | 'R' | 'E' | 'B' | 'G' | '?' | '!' | 'C'
+  symbol: 'U' | 'A' | 'P' | 'R' | 'E' | 'B' | 'G' | '?' | '!' | 'C'
   role: 'user' | 'assistant' | 'system'
   label: string
   body: string
+  marker?: 'I' | 'A' | 'P' | null
+  turn?: number
 }
 
 export type Specimen = {
@@ -85,6 +87,7 @@ export const qualityTags: QualityTag[] = [
 ]
 
 export type SpecimenSourceKind =
+  | 'dataset-eval-cases'
   | 'eval-cases'
   | 'candidate-pushbacks'
   | 'missing'
@@ -97,6 +100,8 @@ export type LoadDiagnostic = {
 }
 
 export type SpecimenSource = {
+  id: string
+  label: string
   path: string
   kind: SpecimenSourceKind
   loaded: number
@@ -105,7 +110,12 @@ export type SpecimenSource = {
   diagnostics: LoadDiagnostic[]
 }
 
+export type LoadedSpecimenSource = SpecimenSource & {
+  specimens: Specimen[]
+}
+
 export type LoadSpecimensResult = {
+  sources: LoadedSpecimenSource[]
   specimens: Specimen[]
   source: SpecimenSource
 }
