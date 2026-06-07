@@ -33,6 +33,14 @@ from swechats.replay import (
     run_claude_reentry_canary,
     write_case_bundle,
 )
+from swechats.smoke import (
+    DEFAULT_BASE_REF,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_DSPY_MODEL,
+    DEFAULT_PUSHBACK_TURN,
+    DEFAULT_SESSION_ID,
+    run_smoke,
+)
 
 app = typer.Typer(help="Explore local SWE-chat data.")
 console = Console()
@@ -366,6 +374,59 @@ def reentry_canary(
         bundle, arm=arm, model=model, max_budget_usd=max_budget_usd
     )
     console.print_json(data=result)
+
+
+@app.command("replay-smoke")
+def replay_smoke(
+    output: Annotated[
+        Path,
+        typer.Argument(help="Output directory for JSON stages and HTML artifact."),
+    ],
+    data_dir: DataDir = Path("data/swe-chat"),
+    repo_cache: Annotated[
+        Path,
+        typer.Option("--repo-cache", help="Bare/mirror cache of the target repo."),
+    ] = Path("data/repos/entireio-cli.git"),
+    session_id: Annotated[str, typer.Option("--session-id")] = DEFAULT_SESSION_ID,
+    pushback_turn: Annotated[int, typer.Option("--pushback-turn")] = DEFAULT_PUSHBACK_TURN,
+    base_ref: Annotated[str, typer.Option("--base-ref")] = DEFAULT_BASE_REF,
+    dspy_model: Annotated[str, typer.Option("--dspy-model")] = DEFAULT_DSPY_MODEL,
+    claude_model: Annotated[str, typer.Option("--claude-model")] = DEFAULT_CLAUDE_MODEL,
+    claude_max_budget_usd: Annotated[
+        float, typer.Option("--claude-max-budget-usd")
+    ] = 2.0,
+    skip_claude: Annotated[
+        bool,
+        typer.Option("--skip-claude", help="Build artifacts but do not run Claude CLI."),
+    ] = False,
+    skip_dspy: Annotated[
+        bool,
+        typer.Option("--skip-dspy", help="Build artifacts but do not call DSPy LM."),
+    ] = False,
+) -> None:
+    """Run the single-case replay smoke and write every stage as JSON."""
+
+    result = run_smoke(
+        output=output,
+        data_dir=data_dir,
+        repo_cache=repo_cache,
+        session_id=session_id,
+        pushback_turn=pushback_turn,
+        base_ref=base_ref,
+        dspy_model=dspy_model,
+        claude_model=claude_model,
+        claude_max_budget_usd=claude_max_budget_usd,
+        run_claude=not skip_claude,
+        run_dspy=not skip_dspy,
+    )
+    console.print_json(
+        data={
+            "run_json": result["artifact_paths"]["run_json"],
+            "html": result["artifact_paths"]["html"],
+            "case_id": result["case"]["case_id"],
+            "scoring": result.get("scoring", {}),
+        }
+    )
 
 
 if __name__ == "__main__":
