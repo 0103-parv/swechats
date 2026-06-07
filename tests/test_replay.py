@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from swechats.native_state import native_state_evidence, parse_json_list, parse_json_object
 from swechats.replay import (
     EvalCase,
     _message_text,
@@ -16,6 +17,102 @@ from swechats.replay import (
     materialize_fork_pair,
     _is_read_only_bash,
 )
+
+
+def test_native_state_evidence_reads_commit_and_file_anchors(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "transcripts").mkdir()
+    pl = pytest.importorskip("polars")
+    pl.DataFrame(
+        [
+            {
+                "session_id": "s1",
+                "checkpoint_ids": '["repo/name#cp1"]',
+                "canonical_checkpoint_pk": "repo/name#cp1",
+            }
+        ]
+    ).write_parquet(data_dir / "sessions.parquet")
+    pl.DataFrame(
+        [
+            {
+                "checkpoint_pk": "repo/name#cp1",
+                "checkpoint_metadata_raw": json.dumps(
+                    {
+                        "checkpoint_id": "cp1",
+                        "branch": "main",
+                        "sessions": [
+                            {
+                                "transcript": "/cp/full.jsonl",
+                                "content_hash": "/cp/hash.txt",
+                                "context": "/cp/context.md",
+                                "prompt": "/cp/prompt.txt",
+                            }
+                        ],
+                    }
+                ),
+            }
+        ]
+    ).write_parquet(data_dir / "checkpoints.parquet")
+    pl.DataFrame(
+        [
+            {
+                "checkpoint_pk": "repo/name#cp1",
+                "status": "ok",
+                "patch": "diff --git a/a.txt b/a.txt\n",
+                "files_changed": "M\ta.txt\n",
+                "agent_changes": json.dumps(
+                    [
+                        {
+                            "tool_name": "Edit",
+                            "file_path": "/repo/a.txt",
+                            "old_string": "old",
+                            "new_string": "new",
+                        }
+                    ]
+                ),
+                "file_attribution": json.dumps(
+                    {
+                        "a.txt": {
+                            "attribution": "agent_only",
+                            "agent_version": "new",
+                            "committed_version": "new",
+                        },
+                        "__aggregate__": {"agent_percentage": 100.0},
+                    }
+                ),
+            }
+        ]
+    ).write_parquet(data_dir / "commits.parquet")
+    pl.DataFrame(
+        [
+            {
+                "session_id": "s1",
+                "session_metadata_raw": json.dumps(
+                    {
+                        "transcript_lines_at_start": 12,
+                        "initial_attribution": {"agent_lines": 1},
+                        "prompt_attributions": [{"checkpoint_number": 1}],
+                    }
+                ),
+            }
+        ]
+    ).write_parquet(data_dir / "session_logs.parquet")
+
+    evidence = native_state_evidence("s1", data_dir)
+
+    assert evidence.has_native_repo_visible_anchors
+    assert evidence.ok_commit_count == 1
+    assert evidence.agent_change_tool_counts == {"Edit": 1}
+    assert evidence.file_attribution_counts == {"agent_only": 1}
+    assert evidence.transcript_boundary["transcript_lines_at_start"] == 12
+
+
+def test_json_helpers_fail_closed() -> None:
+    assert parse_json_list('["a"]') == ["a"]
+    assert parse_json_list('{"not": "a list"}') == []
+    assert parse_json_object('{"ok": true}') == {"ok": True}
+    assert parse_json_object('["not", "an", "object"]') == {}
 
 
 def test_message_text_ignores_tool_results() -> None:

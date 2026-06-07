@@ -59,12 +59,37 @@ the required temporary artifact is normally absent from public SWE-chat.
 | `S` | Exact native temporary snapshot at the fork boundary | Yes |
 | `A` | Exact base commit and proof that the fork worktree was clean | Yes |
 | `B` | Exact base plus replay, validated against independent state anchors | Yes, with validation recorded |
+| `C+` | Repo-visible reconstruction with native commit, agent-change, and file-version anchors, but no exact fork-boundary snapshot | Exploratory; report separately |
 | `C` | Parent/base plus unvalidated tool replay or inferred state | No; exploratory only |
 | `R` | Missing/inconsistent transcript, commit, or replay evidence | Reject |
 
 Tier `B` validation must compare reconstructed file bytes or Git tree hashes
 against evidence not used to perform the replay. A successful application of
 the same logged edits is not independent validation.
+
+Tier `C+` is useful for scaling the reconstructed-context eval without
+pretending we have immaculate state. It uses SWE-chat's native commit artifacts
+as repo-visible anchors:
+
+- `commits.agent_changes`: structured agent mutations (`Edit`, `Write`,
+  `apply_patch`, and related write variants), including old/new strings or full
+  written content.
+- `commits.file_attribution`: per-file `agent_version`, `committed_version`,
+  and `agent_only`/`human_only`/`mixed` attribution.
+- `commits.patch`, `files_changed`, and `numstat`: Git-visible final commit
+  evidence.
+- `session_logs.session_metadata_raw`: checkpoint/session boundary hints such
+  as `transcript_lines_at_start`, `checkpoint_transcript_start`,
+  `transcript_identifier_at_start`, `initial_attribution`, and
+  `prompt_attributions` when present.
+- `checkpoints.checkpoint_metadata_raw`: checkpoint-to-session mappings,
+  branch, files touched, content-hash references, transcript references, and
+  combined attribution when present.
+
+This tier supports the narrower claim that the reconstructed fork is grounded
+in repo-visible native artifacts. It does not prove equality to the historical
+machine state or the exact dirty worktree at an arbitrary mid-conversation
+instruction.
 
 ## Public-Data Replay Procedure
 
@@ -75,16 +100,20 @@ the same logged edits is not independent validation.
 3. Identify the exact base commit. Reject if commit mapping is missing or
    ambiguous.
 4. Search for a snapshot or clean-worktree proof at the boundary.
-5. If the boundary is intermediate, replay every earlier state-changing action.
-   Treat arbitrary shell calls and out-of-band human edits as unresolved until
-   classified or independently validated.
-6. Materialize one certified fork, duplicate it into cold and warm arms, and
+5. If the boundary is intermediate, replay every earlier state-changing action
+   that is directly observed. Treat arbitrary shell calls and out-of-band human
+   edits as unresolved for exact reconstruction unless classified, replayed in
+   isolation, or independently validated.
+6. Load dataset-native repo-visible anchors for the session: commit rows,
+   structured `agent_changes`, `file_attribution`, checkpoint metadata, session
+   metadata, and transcript boundary hints.
+7. Materialize one certified fork, duplicate it into cold and warm arms, and
    verify identical pre-intervention tree and transcript hashes.
-7. Inject memory only into the warm arm. Run both arms with the same runner and
+8. Inject memory only into the warm arm. Run both arms with the same runner and
    model configuration.
-8. Judge the narrow question: does the candidate still exhibit the flaw
+9. Judge the narrow question: does the candidate still exhibit the flaw
    described by `P`?
-9. Record every excluded case and its reason.
+10. Record every excluded case and its reason.
 
 ## Judging Contract
 
@@ -206,6 +235,23 @@ these gates supports the claim:
 
 It does not support the stronger claim that the reconstruction equals the
 historical human worktree.
+
+### Gate V: Native Repo-Visible Anchors
+
+Gate V is a scale path, not a replacement for Gate W. It records whether a
+session has native artifacts that can validate repo-visible state:
+
+- At least one `ok` commit row linked to the session's checkpoint ids.
+- A structured `agent_changes` replay log.
+- Per-file `file_attribution` anchors with `agent_version` and/or
+  `committed_version`.
+- Optional boundary hints from `session_metadata_raw`, especially
+  `transcript_lines_at_start`, `checkpoint_transcript_start`,
+  `transcript_identifier_at_start`, and `prompt_attributions`.
+
+Cases that pass Gate V but fail strict Gate W may be used in a separate
+repo-visible reconstructed pool. The result must be labeled `C+`/exploratory
+unless later validation upgrades it.
 
 ### Verified Smoke Evidence
 

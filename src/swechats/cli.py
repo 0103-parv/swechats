@@ -17,6 +17,12 @@ from swechats.cases import (
     pushback_counts,
     repo_session_counts,
 )
+from swechats.candidate_filter import (
+    DEFAULT_MODEL,
+    DEFAULT_WANDB_BASE_URL,
+    InferenceConfig,
+    filter_candidates,
+)
 from swechats.corpus_audit import corpus_replay_audit
 from swechats.data import table_overview, table_schema
 from swechats.export import write_jsonl
@@ -152,6 +158,84 @@ def build_dataset_eval_cases(
     )
     path = write_jsonl(cases, output)
     console.print(f"Wrote {len(cases)} dataset eval cases to {path}")
+
+
+@app.command("filter-candidates")
+def run_candidate_filter(
+    input_path: Annotated[Path, typer.Argument(help="Candidate/eval-case JSONL input.")],
+    output_path: Annotated[Path, typer.Argument(help="Scored JSONL output.")],
+    model: Annotated[str, typer.Option("--model")] = DEFAULT_MODEL,
+    temperature: Annotated[float, typer.Option("--temperature")] = 1.0,
+    max_tokens: Annotated[
+        int | None,
+        typer.Option(
+            "--max-tokens",
+            help="Omit by default so W&B/model provider does not get a client cap.",
+        ),
+    ] = None,
+    base_url: Annotated[str, typer.Option("--base-url")] = DEFAULT_WANDB_BASE_URL,
+    weave_project: Annotated[
+        str | None,
+        typer.Option(
+            "--weave-project",
+            help="Optional W&B Weave project, usually entity/project.",
+        ),
+    ] = None,
+    limit: Annotated[int | None, typer.Option("--limit", "-n")] = None,
+    concurrency: Annotated[
+        int,
+        typer.Option("--concurrency", "-j", help="Parallel W&B Inference requests."),
+    ] = 1,
+    max_retries: Annotated[
+        int,
+        typer.Option("--max-retries", help="Retries per candidate for 429/5xx/timeouts."),
+    ] = 8,
+    initial_retry_delay: Annotated[
+        float,
+        typer.Option("--initial-retry-delay", help="Initial exponential backoff seconds."),
+    ] = 1.0,
+    max_retry_delay: Annotated[
+        float,
+        typer.Option("--max-retry-delay", help="Maximum exponential backoff seconds."),
+    ] = 60.0,
+) -> None:
+    """Filter eval candidates with W&B Inference and trace calls in Weave."""
+
+    config = InferenceConfig(
+        model=model,
+        base_url=base_url,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        initial_retry_delay_seconds=initial_retry_delay,
+        max_retry_delay_seconds=max_retry_delay,
+    )
+    try:
+        scored = filter_candidates(
+            input_path=input_path,
+            output_path=output_path,
+            config=config,
+            limit=limit,
+            weave_project=weave_project,
+            concurrency=concurrency,
+        )
+    except RuntimeError as error:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(1) from error
+    kept = sum(
+        1
+        for row in scored
+        if row.get("filter_verdict", {}).get("decision") == "keep"
+    )
+    needs_review = sum(
+        1
+        for row in scored
+        if row.get("filter_verdict", {}).get("decision") == "needs_review"
+    )
+    console.print(
+        f"Wrote {len(scored)} filtered rows to {output_path} "
+        f"({kept} keep, {needs_review} needs_review)"
+    )
 
 
 @app.command("corpus-audit")

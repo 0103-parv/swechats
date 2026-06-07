@@ -10,7 +10,12 @@ from typing import Any
 
 import polars as pl
 
-from swechats.data import read_table
+from swechats.data import scan_table
+from swechats.native_state import (
+    NATIVE_AGENT_MUTATION_TOOLS,
+    parse_json_list,
+    parse_json_object,
+)
 from swechats.replay import (
     NON_WORKSPACE_TOOLS,
     _is_read_only_bash,
@@ -21,16 +26,14 @@ PUSHBACK_VALUES = {"correction", "rejection"}
 SUPPORTED_MUTATION_TOOLS = {"Edit", "Write", "edit", "write"}
 
 
+def _collect(frame: pl.LazyFrame) -> pl.DataFrame:
+    """Collect lazy parquet scans with lower memory pressure."""
+
+    return frame.collect(engine="streaming")
+
+
 def _json_list(value: Any) -> list[Any]:
-    if not value:
-        return []
-    if isinstance(value, list):
-        return value
-    try:
-        parsed = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return []
-    return parsed if isinstance(parsed, list) else []
+    return parse_json_list(value)
 
 
 def _has_heredoc(command: str) -> bool:
@@ -60,11 +63,27 @@ def _classify_tool(row: dict[str, Any]) -> str:
     return "unsupported_tool"
 
 
-def _commit_ok_by_session(data_dir: Path | str) -> dict[str, bool]:
-    sessions = read_table("sessions", data_dir).select(
+def _commit_ok_by_session(
+    data_dir: Path | str,
+    session_ids: set[str] | None = None,
+) -> dict[str, bool]:
+    sessions_lf = scan_table("sessions", data_dir).select(
         ["session_id", "checkpoint_ids", "canonical_checkpoint_pk"]
     )
-    commits = read_table("commits", data_dir).select(["checkpoint_pk", "status"])
+    if session_ids is not None:
+        sessions_lf = sessions_lf.filter(pl.col("session_id").is_in(sorted(session_ids)))
+    sessions = _collect(sessions_lf)
+    checkpoint_pks: set[str] = set()
+    for row in sessions.to_dicts():
+        checkpoint_pks.update(str(item) for item in _json_list(row.get("checkpoint_ids")))
+        if row.get("canonical_checkpoint_pk"):
+            checkpoint_pks.add(str(row["canonical_checkpoint_pk"]))
+    commits_lf = scan_table("commits", data_dir).select(["checkpoint_pk", "status"])
+    if checkpoint_pks:
+        commits_lf = commits_lf.filter(pl.col("checkpoint_pk").is_in(sorted(checkpoint_pks)))
+    else:
+        commits_lf = commits_lf.head(0)
+    commits = _collect(commits_lf)
     status_by_checkpoint: dict[str, list[str]] = defaultdict(list)
     for row in commits.to_dicts():
         status_by_checkpoint[str(row["checkpoint_pk"])].append(str(row["status"]))
@@ -90,12 +109,17 @@ def _transcript_sessions(data_dir: Path | str) -> set[str]:
     return {path.stem for path in root.glob("*.jsonl")}
 
 
-def _repo_session_indices(data_dir: Path | str) -> dict[str, int]:
-    sessions = (
-        read_table("sessions", data_dir)
+def _repo_session_indices(
+    data_dir: Path | str,
+    repos: set[str] | None = None,
+) -> dict[str, int]:
+    sessions_lf = (
+        scan_table("sessions", data_dir)
         .select(["repo_id", "session_id", "created_at"])
-        .sort(["repo_id", "created_at", "session_id"])
     )
+    if repos is not None:
+        sessions_lf = sessions_lf.filter(pl.col("repo_id").is_in(sorted(repos)))
+    sessions = _collect(sessions_lf.sort(["repo_id", "created_at", "session_id"]))
     result: dict[str, int] = {}
     current_repo: str | None = None
     index = 0
@@ -109,22 +133,159 @@ def _repo_session_indices(data_dir: Path | str) -> dict[str, int]:
     return result
 
 
+def _native_anchor_summaries(
+    data_dir: Path | str,
+    session_ids: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build lightweight native state anchor summaries keyed by session id."""
+
+    sessions_lf = scan_table("sessions", data_dir).select(
+        ["session_id", "checkpoint_ids", "canonical_checkpoint_pk"]
+    )
+    if session_ids is not None:
+        sessions_lf = sessions_lf.filter(pl.col("session_id").is_in(sorted(session_ids)))
+    sessions = _collect(sessions_lf)
+    session_checkpoint_pks: dict[str, tuple[str, ...]] = {}
+    checkpoint_to_sessions: dict[str, list[str]] = defaultdict(list)
+    for row in sessions.to_dicts():
+        checkpoint_pks = [str(item) for item in _json_list(row.get("checkpoint_ids"))]
+        if row.get("canonical_checkpoint_pk"):
+            checkpoint_pks.append(str(row["canonical_checkpoint_pk"]))
+        unique_checkpoint_pks = tuple(dict.fromkeys(checkpoint_pks))
+        session_id = str(row["session_id"])
+        session_checkpoint_pks[session_id] = unique_checkpoint_pks
+        for checkpoint_pk in unique_checkpoint_pks:
+            checkpoint_to_sessions[checkpoint_pk].append(session_id)
+
+    metadata_lf = scan_table("session_logs", data_dir).select(
+        ["session_id", "session_metadata_raw"]
+    )
+    if session_ids is not None:
+        metadata_lf = metadata_lf.filter(pl.col("session_id").is_in(sorted(session_ids)))
+    metadata_by_session: dict[str, dict[str, Any]] = {}
+    for row in _collect(metadata_lf).to_dicts():
+        metadata_by_session[str(row["session_id"])] = parse_json_object(
+            row.get("session_metadata_raw")
+        )
+
+    accumulators: dict[str, dict[str, Any]] = {
+        session_id: {
+            "status_counts": Counter(),
+            "agent_change_tools": Counter(),
+            "agent_change_count": 0,
+            "file_attribution_entries": 0,
+            "agent_version_files": 0,
+            "committed_version_files": 0,
+        }
+        for session_id in session_checkpoint_pks
+    }
+    checkpoint_pks = set(checkpoint_to_sessions)
+    commits_lf = scan_table("commits", data_dir).select(
+        ["checkpoint_pk", "status", "agent_changes", "file_attribution"]
+    )
+    if checkpoint_pks:
+        commits_lf = commits_lf.filter(pl.col("checkpoint_pk").is_in(sorted(checkpoint_pks)))
+    else:
+        commits_lf = commits_lf.head(0)
+    for commit in _collect(commits_lf).to_dicts():
+        session_ids_for_checkpoint = checkpoint_to_sessions.get(str(commit["checkpoint_pk"]), [])
+        if not session_ids_for_checkpoint:
+            continue
+        status = str(commit.get("status"))
+        agent_changes = [
+            change
+            for change in _json_list(commit.get("agent_changes"))
+            if isinstance(change, dict)
+        ]
+        attribution_entries = [
+            info
+            for path, info in parse_json_object(commit.get("file_attribution")).items()
+            if path != "__aggregate__" and isinstance(info, dict)
+        ]
+        for session_id in session_ids_for_checkpoint:
+            accumulator = accumulators[session_id]
+            accumulator["status_counts"][status] += 1
+            accumulator["agent_change_count"] += len(agent_changes)
+            for change in agent_changes:
+                accumulator["agent_change_tools"][str(change.get("tool_name") or "")] += 1
+            accumulator["file_attribution_entries"] += len(attribution_entries)
+            accumulator["agent_version_files"] += sum(
+                info.get("agent_version") is not None for info in attribution_entries
+            )
+            accumulator["committed_version_files"] += sum(
+                info.get("committed_version") is not None for info in attribution_entries
+            )
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for session_id, checkpoint_pks in session_checkpoint_pks.items():
+        accumulator = accumulators[session_id]
+        status_counts = accumulator["status_counts"]
+        agent_change_tools = accumulator["agent_change_tools"]
+        agent_change_count = accumulator["agent_change_count"]
+        file_attribution_entries = accumulator["file_attribution_entries"]
+        agent_version_files = accumulator["agent_version_files"]
+        committed_version_files = accumulator["committed_version_files"]
+        metadata = metadata_by_session.get(session_id, {})
+        unsupported_native_tools = tuple(
+            sorted(
+                tool
+                for tool in agent_change_tools
+                if tool not in NATIVE_AGENT_MUTATION_TOOLS
+            )
+        )
+        has_ok_commit_anchor = status_counts["ok"] > 0
+        has_agent_change_replay_log = agent_change_count > 0
+        has_file_version_anchors = (
+            agent_version_files > 0 or committed_version_files > 0
+        )
+        summaries[session_id] = {
+            "checkpoint_count": len(checkpoint_pks),
+            "commit_status_counts": dict(status_counts),
+            "ok_commit_count": status_counts["ok"],
+            "agent_change_count": agent_change_count,
+            "agent_change_tool_counts": dict(agent_change_tools),
+            "unsupported_native_agent_change_tools": unsupported_native_tools,
+            "file_attribution_entry_count": file_attribution_entries,
+            "agent_version_file_count": agent_version_files,
+            "committed_version_file_count": committed_version_files,
+            "has_ok_commit_anchor": has_ok_commit_anchor,
+            "has_agent_change_replay_log": has_agent_change_replay_log,
+            "has_file_version_anchors": has_file_version_anchors,
+            "has_native_repo_visible_anchors": (
+                has_ok_commit_anchor
+                and has_agent_change_replay_log
+                and has_file_version_anchors
+            ),
+            "has_transcript_boundary_metadata": any(
+                metadata.get(key) not in (None, "", [])
+                for key in [
+                    "transcript_lines_at_start",
+                    "checkpoint_transcript_start",
+                    "transcript_identifier_at_start",
+                    "transcript_uuid_at_start",
+                ]
+            ),
+            "has_prompt_attributions": bool(metadata.get("prompt_attributions")),
+            "has_initial_attribution": bool(metadata.get("initial_attribution")),
+        }
+    return summaries
+
+
 def _top_repos(data_dir: Path | str, limit: int) -> list[str]:
-    sessions = read_table("sessions", data_dir)
-    return (
-        sessions.group_by("repo_id")
+    repos = _collect(
+        scan_table("sessions", data_dir)
+        .group_by("repo_id")
         .len()
         .sort("len", descending=True)
         .head(limit)
         .select("repo_id")
-        .to_series()
-        .to_list()
     )
+    return repos.to_series().to_list()
 
 
-def _cases_for_repos(data_dir: Path | str, repos: set[str]) -> list[dict[str, Any]]:
-    conversations = (
-        read_table("conversations", data_dir)
+def _conversation_turns_for_repos(data_dir: Path | str, repos: set[str]) -> pl.DataFrame:
+    return _collect(
+        scan_table("conversations", data_dir)
         .filter(
             pl.col("repo_id").is_in(sorted(repos))
             & (pl.col("is_conversational") == True)
@@ -139,13 +300,15 @@ def _cases_for_repos(data_dir: Path | str, repos: set[str]) -> list[dict[str, An
                 "turn_number",
                 "role",
                 "turn_type",
-                "content",
                 "prompt_intent",
                 "prompt_pushback",
             ]
         )
         .sort(["session_id", "turn_number"])
     )
+
+
+def _cases_from_conversation_turns(conversations: pl.DataFrame) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     last_user: dict[str, dict[str, Any]] = {}
     last_assistant: dict[str, dict[str, Any]] = {}
@@ -167,7 +330,7 @@ def _cases_for_repos(data_dir: Path | str, repos: set[str]) -> list[dict[str, An
                         "p_turn_number": int(turn["turn_number"]),
                         "prompt_intent": turn.get("prompt_intent"),
                         "prompt_pushback": label,
-                        "p_content": turn.get("content"),
+                        "p_content": None,
                     }
                 )
         if turn["role"] == "user":
@@ -177,11 +340,15 @@ def _cases_for_repos(data_dir: Path | str, repos: set[str]) -> list[dict[str, An
     return cases
 
 
+def _cases_for_repos(data_dir: Path | str, repos: set[str]) -> list[dict[str, Any]]:
+    return _cases_from_conversation_turns(_conversation_turns_for_repos(data_dir, repos))
+
+
 def _pre_instruction_tool_rows(
     data_dir: Path | str, repos: set[str]
 ) -> dict[tuple[str, int], list[dict[str, Any]]]:
-    tool_rows = (
-        read_table("conversations", data_dir)
+    tool_rows = _collect(
+        scan_table("conversations", data_dir)
         .filter(
             pl.col("repo_id").is_in(sorted(repos))
             & (pl.col("turn_type") == "tool_use")
@@ -232,20 +399,22 @@ def corpus_replay_audit(
 
     repos = [repo] if repo else _top_repos(data_dir, top)
     repo_set = set(repos)
-    sessions = read_table("sessions", data_dir)
-    conversations = read_table("conversations", data_dir)
+    sessions = _collect(
+        scan_table("sessions", data_dir)
+        .filter(pl.col("repo_id").is_in(repos))
+        .select(["repo_id", "session_id", "created_at"])
+    )
     session_counts = {
         row["repo_id"]: int(row["len"])
         for row in sessions.group_by("repo_id").len().to_dicts()
     }
+    conversation_turns = _conversation_turns_for_repos(data_dir, repo_set)
     raw_pushback_counts = {
         row["repo_id"]: int(row["len"])
         for row in (
-            conversations.filter(
-                pl.col("repo_id").is_in(repos)
-                & pl.col("prompt_pushback").is_in(sorted(PUSHBACK_VALUES))
+            conversation_turns.filter(
+                pl.col("prompt_pushback").is_in(sorted(PUSHBACK_VALUES))
                 & (pl.col("role") == "user")
-                & (pl.col("is_conversational") == True)
             )
             .group_by("repo_id")
             .len()
@@ -253,21 +422,32 @@ def corpus_replay_audit(
         )
     }
 
-    commit_ok = _commit_ok_by_session(data_dir)
+    cases = _cases_from_conversation_turns(conversation_turns)
+    case_session_ids = {str(case["session_id"]) for case in cases}
+    commit_ok = _commit_ok_by_session(data_dir, case_session_ids)
+    native_anchors = _native_anchor_summaries(data_dir, case_session_ids)
     transcript_sessions = _transcript_sessions(data_dir)
-    prior_index = _repo_session_indices(data_dir)
-    cases = _cases_for_repos(data_dir, repo_set)
+    prior_index = _repo_session_indices(data_dir, repo_set)
     session_created_at = {
         str(row["session_id"]): row["created_at"]
         for row in sessions.select(["session_id", "created_at"]).to_dicts()
     }
-    tool_rows = (
-        read_table("conversations", data_dir)
+    tool_rows = _collect(
+        scan_table("conversations", data_dir)
         .filter(
             pl.col("repo_id").is_in(repos)
             & (pl.col("turn_type") == "tool_use")
         )
-        .select(["repo_id", "session_id", "turn_number", "tool_name", "command"])
+        .select(
+            [
+                "repo_id",
+                "session_id",
+                "turn_number",
+                "tool_name",
+                "bash_category",
+                "command",
+            ]
+        )
         .sort(["session_id", "turn_number"])
     )
     tools_by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -277,6 +457,7 @@ def corpus_replay_audit(
     repo_stats: dict[str, Counter[str]] = {repo_id: Counter() for repo_id in repos}
     blocker_examples: list[dict[str, Any]] = []
     static_pool_examples: list[dict[str, Any]] = []
+    native_pool_examples: list[dict[str, Any]] = []
     for repo_id in repos:
         repo_stats[repo_id]["sessions"] = session_counts.get(repo_id, 0)
         repo_stats[repo_id]["correction_rejection_user_turns"] = raw_pushback_counts.get(
@@ -296,6 +477,19 @@ def corpus_replay_audit(
             stats["session_commit_mapping_ok"] += 1
         if session_id in transcript_sessions:
             stats["native_transcript_present"] += 1
+        native = native_anchors.get(session_id, {})
+        if native.get("has_ok_commit_anchor"):
+            stats["native_ok_commit_anchor"] += 1
+        if native.get("has_agent_change_replay_log"):
+            stats["native_agent_change_replay_log"] += 1
+        if native.get("has_file_version_anchors"):
+            stats["native_file_version_anchors"] += 1
+        if native.get("has_native_repo_visible_anchors"):
+            stats["native_repo_visible_anchors"] += 1
+        if native.get("has_transcript_boundary_metadata"):
+            stats["native_transcript_boundary_metadata"] += 1
+        if native.get("has_prompt_attributions"):
+            stats["native_prompt_attributions"] += 1
 
         before = _tools_before(tools_by_session, session_id, int(case["i_turn_number"]))
         if not before:
@@ -327,6 +521,11 @@ def corpus_replay_audit(
             and session_id in transcript_sessions
             and prior_index.get(session_id, 0) > 0
         )
+        prereq_native_repo_visible = (
+            bool(native.get("has_native_repo_visible_anchors"))
+            and session_id in transcript_sessions
+            and prior_index.get(session_id, 0) > 0
+        )
         if static_gate_w:
             stats["static_gate_w_classifiable"] += 1
         if prereq_static:
@@ -343,6 +542,37 @@ def corpus_replay_audit(
                         "prompt_intent": case["prompt_intent"],
                         "zero_pre_i_tool_calls": not before,
                         "pre_i_tool_calls": len(before),
+                        "p_content": case["p_content"],
+                    }
+                )
+        if prereq_native_repo_visible:
+            stats["native_repo_visible_candidate_pool"] += 1
+            if not static_gate_w:
+                stats["native_pool_with_gate_w_blocker"] += 1
+            if native.get("has_transcript_boundary_metadata"):
+                stats["native_pool_with_boundary_metadata"] += 1
+            if len(native_pool_examples) < examples:
+                native_pool_examples.append(
+                    {
+                        "repo_id": repo_id,
+                        "session_id": session_id,
+                        "session_created_at": str(session_created_at.get(session_id)),
+                        "p_turn_number": case["p_turn_number"],
+                        "i_turn_number": case["i_turn_number"],
+                        "prompt_pushback": case["prompt_pushback"],
+                        "prompt_intent": case["prompt_intent"],
+                        "static_gate_w_classifiable": static_gate_w,
+                        "pre_i_tool_calls": len(before),
+                        "native_ok_commit_count": native.get("ok_commit_count", 0),
+                        "native_agent_change_count": native.get(
+                            "agent_change_count", 0
+                        ),
+                        "native_file_attribution_entries": native.get(
+                            "file_attribution_entry_count", 0
+                        ),
+                        "has_transcript_boundary_metadata": native.get(
+                            "has_transcript_boundary_metadata", False
+                        ),
                         "p_content": case["p_content"],
                     }
                 )
@@ -375,9 +605,7 @@ def corpus_replay_audit(
                     }
                 )
 
-    bash_rows = conversations.filter(
-        pl.col("repo_id").is_in(repos) & (pl.col("tool_name") == "Bash")
-    ).select(["repo_id", "session_id", "turn_number", "bash_category", "command"])
+    bash_rows = tool_rows.filter(pl.col("tool_name") == "Bash")
     bash_corpus = Counter()
     heredoc_by_repo = Counter()
     heredoc_examples: list[dict[str, Any]] = []
@@ -417,6 +645,7 @@ def corpus_replay_audit(
             "session commit mapping must exist and all statuses must be ok",
             "native transcript file must exist",
             "static Gate W requires every pre-I tool call to be non-workspace, supported Edit/Write mutation, or Bash proven read-only by current classifier",
+            "native repo-visible pool requires transcript, prior same-repo memory, ok commit anchor, structured agent_changes, and file_attribution file-version anchors; it does not claim exact mid-turn worktree equality",
         ],
         "repos": repos,
         "repo_summary": [
@@ -427,4 +656,5 @@ def corpus_replay_audit(
         "heredoc_examples": heredoc_examples,
         "blocker_examples": blocker_examples,
         "static_pool_examples": static_pool_examples,
+        "native_pool_examples": native_pool_examples,
     }

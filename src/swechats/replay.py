@@ -16,6 +16,7 @@ from typing import Any
 import polars as pl
 
 from swechats.data import read_table
+from swechats.native_state import native_state_evidence
 from swechats.paths import SweChatPaths
 
 
@@ -341,6 +342,7 @@ def audit_replay(
     commits = read_table("commits", data_dir).filter(
         pl.col("checkpoint_pk").is_in(checkpoint_pks)
     )
+    native_evidence = native_state_evidence(case.session_id, data_dir)
     commit_rows = commits.select(
         ["commit_sha", "checkpoint_pk", "status", "commit_message"]
     ).to_dicts()
@@ -362,6 +364,11 @@ def audit_replay(
     if mutation_rows.height:
         warnings.append(
             f"{mutation_rows.height} explicit file-mutation tool calls occur before I."
+        )
+    if native_evidence.has_native_repo_visible_anchors:
+        warnings.append(
+            "Dataset-native commit artifacts provide repo-visible validation anchors "
+            "for agent changes and committed file versions."
         )
     if bash_rows.height:
         warnings.append(
@@ -400,6 +407,7 @@ def audit_replay(
                 ),
                 "error": transcript_error,
             },
+            "native_repo_visible_state": native_evidence.to_dict(),
             "temporary_shadow_snapshot": {
                 "available": False,
                 "reason": "Entire shadow branches are local, temporary, and not in SWE-chat.",
@@ -422,6 +430,10 @@ def audit_replay(
                 "S": "Exact native snapshot at fork boundary.",
                 "A": "Exact base commit plus proof of a clean worktree at boundary.",
                 "B": "Replay from exact base, validated against independent state anchors.",
+                "C+": (
+                    "Repo-visible reconstruction with native commit/agent-change/"
+                    "file-version anchors, but no exact fork-boundary snapshot."
+                ),
                 "C": "Approximate reconstruction; exploratory only.",
                 "R": "Reject because required published evidence is missing or inconsistent.",
             },
@@ -519,6 +531,16 @@ def write_case_bundle(
         for row in original_trajectory(case, data_dir):
             handle.write(json.dumps(row, default=str, ensure_ascii=False) + "\n")
     (output / "pushback.txt").write_text(case.pushback + "\n", encoding="utf-8")
+    (output / "native-state.json").write_text(
+        json.dumps(
+            native_state_evidence(case.session_id, data_dir).to_dict(),
+            indent=2,
+            default=str,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (output / "judge-rubric.json").write_text(
         json.dumps(judge_rubric(case), indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -983,6 +1005,11 @@ def materialize_fork_pair(
         "base_ref": base_ref,
         "resolved_commit": resolved_commit,
         "base_ref_evidence": "operator_supplied; certification belongs in replay audit",
+        "native_state_evidence": (
+            json.loads((bundle / "native-state.json").read_text(encoding="utf-8"))
+            if (bundle / "native-state.json").exists()
+            else native_state_evidence(manifest["case"]["session_id"], data_dir).to_dict()
+        ),
         "workspace_construction": "independent_git_clone_plus_observed_agent_replay",
         "cold_git_state_before_memory": cold_git,
         "warm_git_state_before_memory": warm_git,
