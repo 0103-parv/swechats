@@ -23,6 +23,15 @@ class SweChatPaths:
     def transcripts_dir(self) -> Path:
         return self.root / "transcripts"
 
+    def transcript(self, session_id: str) -> Path:
+        return self.transcripts_dir / f"{session_id}.jsonl"
+
+    def require_transcript(self, session_id: str) -> Path:
+        path = self.transcript(session_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Missing native transcript: {path}")
+        return path
+
     def table(self, name: str) -> Path:
         filename = name if name.endswith(".parquet") else f"{name}.parquet"
         return self.root / filename
