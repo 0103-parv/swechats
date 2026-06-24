@@ -5,6 +5,7 @@ from pathlib import Path
 
 from swechats.replay import EvalCase
 from swechats.smoke import (
+    build_memory_corpus,
     build_oracle_packet,
     format_learned_memory,
     render_candidate_for_judge,
@@ -132,3 +133,93 @@ def test_build_oracle_packet_uses_history_and_user_only_downstream(monkeypatch) 
     downstream = json.loads(oracle.downstream_user_messages)
     assert [row["turn_number"] for row in downstream] == [41, 43]
     assert "accepted_outcome" not in oracle.model_dump()
+
+
+def test_build_memory_corpus_uses_only_prior_repo_corrections(monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    import polars as pl
+
+    prior_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    target_time = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+    def fake_read_table(name, data_dir):
+        if name == "sessions":
+            return pl.DataFrame(
+                [
+                    {
+                        "session_id": "prior",
+                        "repo_id": "entireio/cli",
+                        "created_at": prior_time,
+                    },
+                    {
+                        "session_id": "session",
+                        "repo_id": "entireio/cli",
+                        "created_at": target_time,
+                    },
+                    {
+                        "session_id": "future",
+                        "repo_id": "entireio/cli",
+                        "created_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
+                    },
+                ]
+            )
+        assert name == "conversations"
+        return pl.DataFrame(
+            [
+                {
+                    "session_id": "prior",
+                    "repo_id": "entireio/cli",
+                    "turn_id": "prior#1",
+                    "turn_number": 1,
+                    "role": "user",
+                    "is_conversational": True,
+                    "content": "update notes",
+                    "prompt_pushback": None,
+                    "file_path": None,
+                },
+                {
+                    "session_id": "prior",
+                    "repo_id": "entireio/cli",
+                    "turn_id": "prior#2",
+                    "turn_number": 2,
+                    "role": "assistant",
+                    "is_conversational": True,
+                    "content": "thanked maintainers",
+                    "prompt_pushback": None,
+                    "file_path": None,
+                },
+                {
+                    "session_id": "prior",
+                    "repo_id": "entireio/cli",
+                    "turn_id": "prior#3",
+                    "turn_number": 3,
+                    "role": "assistant",
+                    "is_conversational": False,
+                    "content": "",
+                    "prompt_pushback": None,
+                    "file_path": "CHANGELOG.md",
+                },
+                {
+                    "session_id": "prior",
+                    "repo_id": "entireio/cli",
+                    "turn_id": "prior#4",
+                    "turn_number": 4,
+                    "role": "user",
+                    "is_conversational": True,
+                    "content": "maintainers are internal",
+                    "prompt_pushback": "correction",
+                    "file_path": None,
+                },
+            ]
+        )
+
+    monkeypatch.setattr("swechats.smoke.read_table", fake_read_table)
+
+    corpus = build_memory_corpus(_case(), Path("data/swe-chat"))
+
+    assert corpus.cutoff_session_id == "session"
+    assert [episode.session_id for episode in corpus.prior_episodes] == ["prior"]
+    assert corpus.prior_episodes[0].correction == "maintainers are internal"
+    assert corpus.prior_episodes[0].turn_id == "prior#4"
+    assert corpus.prior_episodes[0].file_paths == ["CHANGELOG.md"]

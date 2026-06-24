@@ -10,7 +10,7 @@ import subprocess
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import dspy
 import polars as pl
@@ -21,6 +21,15 @@ from swechats.dspysigs import (
     Judge,
     OraclePacket,
     RubricGenerator,
+)
+from swechats.memory_sigs import (
+    Critic,
+    MemoryArtifact,
+    MemoryCorpus,
+    OursLearner,
+    Placer,
+    PriorEpisode,
+    Proposer,
 )
 from swechats.replay import (
     EvalCase,
@@ -42,6 +51,7 @@ DEFAULT_PUSHBACK_TURN = 41
 DEFAULT_BASE_REF = "bc0448c6c67cb8c5e90c46811487d1e2ad8a36fa"
 DEFAULT_DSPY_MODEL = "openai/gpt-5.5"
 DEFAULT_CLAUDE_MODEL = "sonnet"
+MemoryLearnerName = Literal["ours", "placeholder"]
 
 
 def _json_default(value: Any) -> Any:
@@ -188,6 +198,108 @@ def prior_memory_source_rows(
         .to_dicts()
     )
     return rows
+
+
+def build_memory_corpus(
+    case: EvalCase,
+    data_dir: Path,
+    *,
+    limit: int = 64,
+) -> MemoryCorpus:
+    """Build d_e from correction episodes in chronological prior repo sessions."""
+
+    target_created_at = _case_session_created_at(case, data_dir)
+    sessions = read_table("sessions", data_dir).select(
+        ["session_id", "repo_id", "created_at"]
+    )
+    prior_sessions = sessions.filter(
+        (pl.col("repo_id") == case.repo_id) & (pl.col("session_id") != case.session_id)
+    )
+    if target_created_at is not None:
+        prior_sessions = prior_sessions.filter(pl.col("created_at") < target_created_at)
+    prior_ids = (
+        prior_sessions.sort("created_at").select("session_id").to_series().to_list()
+    )
+
+    turns = (
+        read_table("conversations", data_dir)
+        .filter((pl.col("repo_id") == case.repo_id) & pl.col("session_id").is_in(prior_ids))
+        .sort(["session_id", "turn_number"])
+        .to_dicts()
+    )
+    by_session: dict[str, list[dict[str, Any]]] = {}
+    for turn in turns:
+        by_session.setdefault(str(turn["session_id"]), []).append(turn)
+
+    episodes: list[PriorEpisode] = []
+    for session_id in prior_ids:
+        session_turns = by_session.get(str(session_id), [])
+        last_user: dict[str, Any] | None = None
+        last_assistant: dict[str, Any] | None = None
+        for turn in session_turns:
+            if (
+                turn.get("role") == "user"
+                and turn.get("is_conversational")
+                and turn.get("prompt_pushback") in {"correction", "rejection"}
+                and last_user
+                and last_assistant
+            ):
+                instruction_number = int(last_user["turn_number"])
+                pushback_number = int(turn["turn_number"])
+                file_paths = sorted(
+                    {
+                        str(row["file_path"])
+                        for row in session_turns
+                        if row.get("file_path")
+                        and instruction_number < int(row["turn_number"]) < pushback_number
+                    }
+                )
+                episodes.append(
+                    PriorEpisode(
+                        session_id=str(session_id),
+                        turn_id=str(turn.get("turn_id") or f"{session_id}#{pushback_number}"),
+                        instruction=str(last_user.get("content") or ""),
+                        action=str(last_assistant.get("content") or ""),
+                        correction=str(turn.get("content") or ""),
+                        file_paths=file_paths,
+                    )
+                )
+            if turn.get("is_conversational") and turn.get("role") == "user":
+                last_user = turn
+            elif turn.get("is_conversational") and turn.get("role") == "assistant":
+                last_assistant = turn
+
+    return MemoryCorpus(
+        repo_id=case.repo_id,
+        cutoff_session_id=case.session_id,
+        prior_episodes=episodes[-limit:],
+    )
+
+
+async def learn_ours_memory(corpus: MemoryCorpus, *, model: str) -> MemoryArtifact:
+    """Run the real Proposer -> Critic -> Placer learner."""
+
+    lm = configure_dspy_lm(model)
+    learner = OursLearner(
+        proposer=Proposer(lm=lm),
+        critic=Critic(lm=lm),
+        placer=Placer(lm=lm, clamp_to_root=True),
+    )
+    return await learner.learn(corpus)
+
+
+def render_memory_artifact(artifact: MemoryArtifact) -> str:
+    """Render the v1 single-file artifact for warm-arm injection."""
+
+    files = artifact.render()
+    if not files:
+        return ""
+    if set(files) != {"AGENTS.md"}:
+        raise ValueError(
+            "The smoke harness currently supports one root memory file; "
+            f"learner rendered {sorted(files)}."
+        )
+    return files["AGENTS.md"]
 
 
 def _truncate_one_line(text: str, limit: int = 700) -> str:
@@ -561,9 +673,12 @@ def run_smoke(
     dspy_model: str = DEFAULT_DSPY_MODEL,
     claude_model: str = DEFAULT_CLAUDE_MODEL,
     claude_max_budget_usd: float = 2.0,
+    memory_learner: MemoryLearnerName = "ours",
     run_claude: bool = True,
     run_dspy: bool = True,
 ) -> dict[str, Any]:
+    if memory_learner not in {"ours", "placeholder"}:
+        raise ValueError(f"Unknown memory learner: {memory_learner}")
     output.mkdir(parents=True, exist_ok=True)
     stages: list[dict[str, Any]] = []
 
@@ -606,22 +721,39 @@ def run_smoke(
     )
     oracle = build_oracle_packet(case, data_dir)
     record(5, "oracle_packet", oracle.model_dump())
-    source_rows = prior_memory_source_rows(case, data_dir)
-    codeowners = codeowners_at_ref(repo_cache, base_ref)
-    memory = format_learned_memory(case, source_rows=source_rows, codeowners=codeowners)
+    corpus = build_memory_corpus(case, data_dir)
+    record(6, "memory_corpus", corpus.model_dump())
+    source_rows: list[dict[str, Any]] = []
+    memory_artifact: MemoryArtifact | None = None
+    if memory_learner == "ours":
+        if not run_dspy:
+            raise ValueError(
+                "The ours memory learner requires DSPy calls. Remove --skip-dspy or "
+                "use --memory-learner placeholder."
+            )
+        memory_artifact = asyncio.run(learn_ours_memory(corpus, model=dspy_model))
+        memory = render_memory_artifact(memory_artifact)
+    else:
+        source_rows = prior_memory_source_rows(case, data_dir)
+        codeowners = codeowners_at_ref(repo_cache, base_ref)
+        memory = format_learned_memory(
+            case, source_rows=source_rows, codeowners=codeowners
+        )
     memory_path = output / "learned-memory.md"
     memory_path.write_text(memory, encoding="utf-8")
     record(
-        6,
+        7,
         "memory",
         {
+            "learner": memory_learner,
             "memory_path": str(memory_path),
             "sha256": sha256(memory.encode()).hexdigest(),
             "target": "CLAUDE.md",
+            "artifact": memory_artifact.model_dump() if memory_artifact else None,
             "source_rows": source_rows,
-            "source_row_count": len(source_rows),
+            "source_episode_count": len(corpus.prior_episodes),
             "target_session_excluded": all(
-                row.get("session_id") != case.session_id for row in source_rows
+                episode.session_id != case.session_id for episode in corpus.prior_episodes
             ),
         },
     )
@@ -637,7 +769,7 @@ def run_smoke(
             append_memory=True,
             data_dir=data_dir,
         )
-    record(7, "fork_pair", fork_result or {"ok": False, "reason": "missing repo cache"})
+    record(8, "fork_pair", fork_result or {"ok": False, "reason": "missing repo cache"})
 
     canaries: dict[str, Any] = {}
     if fork_result and run_claude:
@@ -648,7 +780,7 @@ def run_smoke(
                 )
             except Exception as exc:  # pragma: no cover - integration path
                 canaries[arm] = {"passed": False, "error": str(exc)}
-    record(8, "reentry_canaries", canaries)
+    record(9, "reentry_canaries", canaries)
 
     candidates: dict[str, Any] = {}
     if fork_result and run_claude and all(
@@ -667,7 +799,7 @@ def run_smoke(
             "cold": {"ok": False, "rendered": "", "reason": "candidate run skipped"},
             "warm": {"ok": False, "rendered": "", "reason": "candidate run skipped"},
         }
-    record(9, "candidates", candidates)
+    record(10, "candidates", candidates)
 
     scoring: dict[str, Any] = {}
     if run_dspy and candidates.get("cold") and candidates.get("warm"):
@@ -697,7 +829,7 @@ def run_smoke(
                 "ok": False,
                 "reason": "candidate action missing",
             }
-    record(10, "dspy_scoring", scoring)
+    record(11, "dspy_scoring", scoring)
 
     run = {
         "schema_version": SMOKE_SCHEMA_VERSION,
@@ -711,6 +843,7 @@ def run_smoke(
             "dspy_adapter": "XMLAdapter",
             "claude_model": claude_model,
             "claude_max_budget_usd": claude_max_budget_usd,
+            "memory_learner": memory_learner,
         },
         "case": asdict(case),
         "stages": stages,

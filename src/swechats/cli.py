@@ -395,6 +395,13 @@ def replay_smoke(
     claude_max_budget_usd: Annotated[
         float, typer.Option("--claude-max-budget-usd")
     ] = 2.0,
+    memory_learner: Annotated[
+        str,
+        typer.Option(
+            "--memory-learner",
+            help="Memory learner: ours (real DSPy pipeline) or placeholder.",
+        ),
+    ] = "ours",
     skip_claude: Annotated[
         bool,
         typer.Option("--skip-claude", help="Build artifacts but do not run Claude CLI."),
@@ -416,6 +423,7 @@ def replay_smoke(
         dspy_model=dspy_model,
         claude_model=claude_model,
         claude_max_budget_usd=claude_max_budget_usd,
+        memory_learner=memory_learner,
         run_claude=not skip_claude,
         run_dspy=not skip_dspy,
     )

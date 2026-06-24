@@ -96,6 +96,9 @@ class PriorEpisode(BaseModel):
     boundary rule; a clean committed turn -> a guard fact (Atlas dual source)."""
 
     session_id: str
+    turn_id: str = Field(
+        description="Source turn id for evidence citations, usually the correction turn."
+    )
     instruction: str = Field(description='u: what the user asked in the prior session.')
     action: str = Field(description='a: what the prior agent did.')
     correction: str = Field(
