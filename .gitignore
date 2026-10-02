@@ -4,3 +4,9 @@ artifacts/eval-cases-dataset*.jsonl
 .venv/
 __pycache__/
 *.py[cod]
+
+# Sensitive / not-for-public (parental consent signatures, unpublished co-authored draft)
+OpenReview_Consent_FILLABLE.pdf
+OpenReview_Consent_MOM_SIGN_HERE.pdf
+OpenReview_Consent_SIGNED_FINAL.pdf
+overfitting_the_judge_neurips.pdf
